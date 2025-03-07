@@ -1,0 +1,48 @@
+# Configuration for Meta-Learning with funcBO
+
+# System settings
+system:
+  device: "cuda"  # "cuda" or "cpu"
+  dtype: "float32"  # "float32" or "float64"
+
+# Method settings
+method: "funcBO"  # Options: "MAML", "ANIL", "funcBO"
+
+# Data settings
+seed: 42
+shots: 5  # k-shot learning
+ways: 5   # n-way classification
+batch_size: 4
+max_epochs: 10000
+data_dir: "./data"
+
+# Optimization parameters
+inner_steps: 5      # Number of gradient steps for task adaptation
+inner_lr: 0.1       # Learning rate for inner adaptation
+reg_lambda: 0.01    # Regularization parameter
+outer_lr: 0.001     # Meta-learning rate
+outer_wd: 0.0001    # Weight decay for outer optimization
+
+# Optimizer settings
+outer_optimizer:
+    outer_lr: 0.0001
+    outer_wd: 0.01
+
+inner_solver:
+    name: 'funcBO.solvers.IterativeSolver'
+    optimizer:
+        name: 'torch.optim.Adam'
+        lr: 1.0e-05
+        weight_decay: 0.1
+    num_iter: 20
+
+dual_solver:
+    name: 'funcBO.solvers.IterativeSolver'
+    optimizer:
+        name: 'torch.optim.Adam'
+        lr: 0.0001
+        weight_decay: 0.1
+    num_iter: 20
+
+dual_model:
+    name: 'funcBO.dual_networks.DualNetwork'

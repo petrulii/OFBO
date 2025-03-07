@@ -4,6 +4,7 @@ from functools import partial
 from collections import namedtuple
 import numpy as np
 import pickle
+import time
 
 
 # Replay buffer class for storing transitions
@@ -19,6 +20,8 @@ class ReplayBuffer:
     self.rewards = jnp.empty((capacity, 1), dtype=jnp.float32)
     self.not_dones = jnp.empty((capacity, 1), dtype=jnp.float32)
     self.not_dones_no_max = jnp.empty((capacity, 1), dtype=jnp.float32)
+    # Add observation times array
+    self.obs_times = jnp.empty((capacity, 1), dtype=jnp.float32)
 
     self.idx = 0
     self.full = False
@@ -34,6 +37,9 @@ class ReplayBuffer:
     self.next_obses = self.next_obses.at[self.idx].set(next_obs)
     self.not_dones = self.not_dones.at[self.idx].set(not done)
     self.not_dones_no_max = self.not_dones_no_max.at[self.idx].set(not done_no_max)
+    # Add current timestamp
+    current_time = time.time()
+    self.obs_times = self.obs_times.at[self.idx].set(current_time)
 
     self.idx = (self.idx + 1) % self.capacity
     self.full = self.full or self.idx == 0
@@ -47,7 +53,49 @@ class ReplayBuffer:
     next_obses = self.next_obses[idxs]
     not_dones = self.not_dones[idxs]
     not_dones_no_max = self.not_dones_no_max[idxs]
+    
+    return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
 
+  def sample_time_weighted(self, batch_size, decay_factor=0.3, replace=True):
+    """
+    Sample transitions with probability proportional to recency.
+    
+    Args:
+        batch_size: Number of transitions to sample
+        decay_factor: Controls how quickly importance decays with time
+                      Higher values prioritize recent samples more strongly
+        replace: Whether to sample with replacement
+        
+    Returns:
+        Tuple of batch data including timestamps
+    """
+    buffer_size = len(self)
+    
+    # Calculate time-based sampling weights
+    current_time = time.time()
+    times = self.obs_times[:buffer_size].flatten()
+    relative_times = current_time - times
+    
+    # Compute probabilities using exponential decay
+    # More recent observations get higher probabilities
+    probs = jnp.exp(-decay_factor * relative_times)
+    
+    # Convert to numpy for np.random.choice and normalize
+    probs = np.array(probs)
+    probs = probs / probs.sum()
+    
+    # Sample based on time weights
+    idxs = np.random.choice(buffer_size, size=batch_size, replace=replace, p=probs)
+    
+    # Retrieve sampled transitions
+    obses = self.obses[idxs]
+    actions = self.actions[idxs]
+    rewards = self.rewards[idxs]
+    next_obses = self.next_obses[idxs]
+    not_dones = self.not_dones[idxs]
+    not_dones_no_max = self.not_dones_no_max[idxs]
+    obs_times = self.obs_times[idxs]
+    
     return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
 
   def save(self, data_path):
@@ -57,26 +105,40 @@ class ReplayBuffer:
       self.rewards,
       self.next_obses,
       self.not_dones,
-      self.not_dones_no_max
+      self.not_dones_no_max,
+      self.obs_times  # Save observation times
     ]
     pickle.dump(all_data, open(data_path, 'wb'))
-  
+        
   def load(self, data_path):
-    self.obses, self.actions, self.rewards, self.next_obses, \
-      self.not_dones, self.not_dones_no_max = pickle.load(open(data_path, "rb"))
+    loaded_data = pickle.load(open(data_path, "rb"))
+    # Handle both old format (6 elements) and new format (7 elements)
+    if len(loaded_data) == 7:
+        self.obses, self.actions, self.rewards, self.next_obses, \
+        self.not_dones, self.not_dones_no_max, self.obs_times = loaded_data
+    else:
+        # For backwards compatibility with old saved buffers
+        self.obses, self.actions, self.rewards, self.next_obses, \
+        self.not_dones, self.not_dones_no_max = loaded_data
+        # Initialize observation times for old data
+        self.obs_times = jnp.zeros((len(self.obses), 1), dtype=jnp.float32)
+        
     self.capacity = len(self.obses)
     self.full = True
 
 # Evaluation function used in the main training loop
 
-def evaluate(agent, eval_env, rng, num_eval_episodes=10):
+def evaluate(agent, eval_env, rng, num_eval_episodes=10, masscart=None):
     """Evaluate the agent's performance in the environment."""
+    if masscart is not None:
+        # Make sure cart mass matches the training environment cart mass
+        eval_env.unwrapped.masscart = masscart
     average_episode_reward = 0
     for episode in range(num_eval_episodes):
         obs, _ = eval_env.reset()
-        done = False
+        done, truncated = False, False
         episode_reward = 0
-        while not done:
+        while not (done or truncated):
             rng, _ = jax.random.split(rng)
             action = agent.act(agent.params_Q, obs, rng).item()
             obs, reward, done, truncated, info = eval_env.step(action)

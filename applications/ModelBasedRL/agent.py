@@ -605,7 +605,7 @@ class Agent:
     def update(self, replay_buffer):
         """Main update method for training."""
         # Sample from replay buffer
-        replay = replay_buffer.sample(self.args.batch_size)
+        replay = replay_buffer.sample_time_weighted(self.args.batch_size)
         
         # Different update strategies based on agent type
         if self.args.agent_type in ['omd', 'funcBO']:
@@ -661,7 +661,7 @@ class Agent:
             # Update world model
             for i in range(self.args.num_T_steps):
                 aux_params = AuxP(None, None, None, next(self.rngs))
-                replay = replay_buffer.sample(self.args.batch_size)
+                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
                 updout_T = self.update_step(
                     self.params_T, aux_params, self.opt_state_T, 
                     None, replay, 'mle'
@@ -670,7 +670,7 @@ class Agent:
             
             # Update Q-function
             for i in range(self.args.num_Q_steps):
-                replay = replay_buffer.sample(self.args.batch_size)
+                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
                 replay_model, nll = self.batch_real_to_model(
                     self.params_T, replay, next(self.rngs)
                 )
@@ -695,7 +695,7 @@ class Agent:
             # Update world model
             for i in range(self.args.num_T_steps):
                 aux_params = AuxP(self.params_V, None, None, next(self.rngs))
-                replay = replay_buffer.sample(self.args.batch_size)
+                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
                 updout_T = self.update_step(
                     self.params_T, aux_params, self.opt_state_T, 
                     None, replay, 'vep'
@@ -704,7 +704,7 @@ class Agent:
             
             # Update Q-function
             for i in range(self.args.num_Q_steps):
-                replay = replay_buffer.sample(self.args.batch_size)
+                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
                 replay_model, nll = self.batch_real_to_model(
                     self.params_T, replay, next(self.rngs)
                 )

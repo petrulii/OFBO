@@ -4,6 +4,7 @@ import numpy as np
 import time
 import haiku as hk
 import jax
+import math
 
 from agent import Agent
 from utils import ReplayBuffer, evaluate
@@ -52,6 +53,11 @@ class Trainer:
         self.episode = 0
         self.episode_return = 0
         self.episode_step = 0
+
+        # Non-stationary environment settings
+        self.base_masscart = self.env.unwrapped.masscart # Store the original mass values
+        self.base_masspole = self.env.unwrapped.masspole
+        self.masscart = self.base_masscart
     
     def train(self):
         """
@@ -77,7 +83,7 @@ class Trainer:
             # Periodically evaluate agent
             if self.step % self.config.eval_frequency == 0:
                 # Passing random generator to ensure reproducibility
-                eval_return = evaluate(self.agent, self.eval_env, next(self.rngs))
+                eval_return = evaluate(self.agent, self.eval_env, next(self.rngs), masscart=self.masscart)
                 eval_time = time.time()
                 
                 wandb.log({
@@ -99,7 +105,7 @@ class Trainer:
             # Handle episode termination
             done_float = float(done)
             # Allow infinite bootstrap if termination is due to time limit
-            done_no_max = 0 if self.episode_step + 1 == self.env._max_episode_steps else done_float
+            done_no_max = 0 if truncated else done_float
             
             # Track episode return
             self.episode_return += reward
@@ -110,14 +116,18 @@ class Trainer:
             # Update current state and counters
             obs = next_obs
             self.episode_step += 1
+            # If the environment is non-stationary, update mass
+            if self.config.non_stationary:
+                self.masscart = self.update_mass()
             self.step += 1
             
             # Handle end of episode
-            if done:
+            if (done or truncated):
                 # Log episode results
                 wandb.log({
                     'train/avg_episode_reward': self.episode_return,
-                    'train/time': time.time() - start_time
+                    'train/time': time.time() - start_time,
+                    'train/cart_mass': self.env.unwrapped.masscart
                 }, step=self.step)
                 
                 # Reset environment and episode tracking
@@ -138,11 +148,25 @@ class Trainer:
                 agent_metrics = self.agent.update(self.replay_buffer)
         
         # Final evaluation with more episodes
-        final_eval_return = evaluate(self.agent, self.eval_env, next(self.rngs), num_eval_episodes=20)
+        final_eval_return = evaluate(self.agent, self.eval_env, next(self.rngs), num_eval_episodes=20, masscart=self.masscart)
         
         wandb.log({
             'eval/final_episode_return': final_eval_return
         }, step=self.step)
         
         wandb.finish()
+
         return final_eval_return
+
+    def update_mass(self):
+        """Update cart mass according to sinusoidal pattern."""
+        # Calculate phase based on current step
+        phase = 2 * math.pi * (self.step / self.config.change_frequency)
+        
+        # Reset to base mass and apply variation
+        self.env.unwrapped.masscart = self.base_masscart * (1 + self.config.amplitude * math.sin(phase))
+        
+        # Update total mass
+        self.env.unwrapped.total_mass = self.env.unwrapped.masscart + self.env.unwrapped.masspole
+        
+        return self.env.unwrapped.masscart

@@ -20,7 +20,7 @@ def train(ctx: mlxp.Context) -> None:
     log_dir = ctx.logger.log_dir 
     clear_dir(os.path.join(log_dir,'metrics'))
 
-    from applications.ModelBasedRL.funcBO.trainer import Trainer
+    from trainer import Trainer
     trainer = Trainer(ctx.config, ctx.logger)
 
     # Call the train method of the Trainer instance

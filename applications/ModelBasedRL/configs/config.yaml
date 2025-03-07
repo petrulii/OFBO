@@ -15,10 +15,13 @@ num_ensemble_vep: 5
 eps: 0.1
 discount: 0.99
 lr: 0.001
-inner_lr: 0.0003 # 0.001, 0.003
+inner_lr: 0.0003
 dual_lr: 0.0003
 alpha: 0.01
-tau: 0.01 # 0.005
+tau: 0.01
+non_stationary: True
+change_frequency: 10000
+amplitude: 0.5
 save_buf: False
 save_agent: False
 hard: False
@@ -28,5 +31,5 @@ warm_opt: False
 no_double: False
 with_inv_jac: False
 
-agent_type: 'mle'
+agent_type: 'funcBO'
 
