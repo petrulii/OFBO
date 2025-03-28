@@ -39,6 +39,9 @@ class Objective:
       if use_previous_data and self.data:
         data = self.data
       else: 
+        # Check if inner_dataloader is an iterator, if not, convert it
+        if not hasattr(self.inner_dataloader, '__next__'):
+            self.inner_dataloader = iter(self.inner_dataloader)
         data = next(self.inner_dataloader)
         self.data = data
       return data    
@@ -48,10 +51,12 @@ class Objective:
       inner_model_inputs, outer_model_inputs, inner_loss_inputs =  self.data_projector(data)
       func_val = inner_model(inner_model_inputs)
       outer_model_val = self.outer_model(outer_model_inputs)
-      if inner_loss_inputs is not None:
-        loss = self.inner_loss(outer_model_val,func_val)
-      else:
+
+      # Compute the inner loss based on if it requires additional inputs
+      if inner_loss_inputs is None:
         loss = self.inner_loss(outer_model_val, func_val)
+      else:
+        loss = self.inner_loss(outer_model_val, func_val, inner_loss_inputs)
 
       return loss
 
@@ -98,14 +103,6 @@ class DualObjective:
     dual_val_outer = dual_model(dual_model_inputs)
     B_inner = dual_val_inner.shape[0]
     B_outer = dual_val_outer.shape[0]
-    ################### DEBUG
-    # Check if hessian is close to identity and exit
-    hess = hessian(f, inner_model_output)
-    identity = torch.eye(hess.shape[0], device=hess.device)
-    print('Hessian shape:', hess.shape)
-    print('Hessian:', hess)
-    exit(0)
-    ###################
     hessvp = autograd.functional.hvp(f, inner_model_output, dual_val_inner)[1]
 
     # Compute the loss

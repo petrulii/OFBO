@@ -2,47 +2,57 @@
 
 # System settings
 system:
-  device: "cuda"  # "cuda" or "cpu"
-  dtype: "float32"  # "float32" or "float64"
+  device: 0  # GPU device ID (use -2 for CPU)
+  dtype: 64  # 32 for float, 64 for double
+  seed: 42
 
 # Method settings
-method: "funcBO"  # Options: "MAML", "ANIL", "funcBO"
+agent_type: "funcBO"  # Only funcBO is fully implemented
 
 # Data settings
-seed: 42
+dataset: "fc100"  # Fixed to FC100 for this implementation
 shots: 5  # k-shot learning
-ways: 5   # n-way classification
+ways: 5  # n-way classification
 batch_size: 4
 max_epochs: 10000
 data_dir: "./data"
 
 # Optimization parameters
-inner_steps: 5      # Number of gradient steps for task adaptation
-inner_lr: 0.1       # Learning rate for inner adaptation
-reg_lambda: 0.01    # Regularization parameter
-outer_lr: 0.001     # Meta-learning rate
-outer_wd: 0.0001    # Weight decay for outer optimization
+inner_steps: 5  # Number of gradient steps for task adaptation
+outer_lr: 0.00001  # Meta-learning rate for feature extractor
+outer_wd: 0.01  # Weight decay for outer optimization
+reg_lambda: 0.01  # Regularization parameter
 
-# Optimizer settings
-outer_optimizer:
-    outer_lr: 0.0001
-    outer_wd: 0.01
+# Model parameters for FC100
+feature_params:
+  hidden_size: 64
+  channels: 3
+  feature_dim: 256
 
+network_params:
+  input_dim: 3072 # 3 channels × 32 × 32 pixels for FC100
+  hidden_dim: 256
+  hidden_layers: 3
+  output_dim: 5  # Same as ways
+
+# Solver configurations
 inner_solver:
-    name: 'funcBO.solvers.IterativeSolver'
-    optimizer:
-        name: 'torch.optim.Adam'
-        lr: 1.0e-05
-        weight_decay: 0.1
-    num_iter: 20
+  name: 'funcBO.solvers.IterativeSolver'
+  optimizer:
+    name: 'torch.optim.SGD'
+    lr: 0.00001
+    momentum: 0.9
+  num_iter: 1
 
 dual_solver:
-    name: 'funcBO.solvers.IterativeSolver'
-    optimizer:
-        name: 'torch.optim.Adam'
-        lr: 0.0001
-        weight_decay: 0.1
-    num_iter: 20
+  name: 'funcBO.solvers.IterativeSolver'
+  optimizer:
+    name: 'torch.optim.SGD'
+    lr: 0.00001  # Matched with inner_lr
+    momentum: 0.9
+  num_iter: 1
 
 dual_model:
-    name: 'funcBO.dual_networks.DualNetwork'
+  name: 'funcBO.dual_networks.LinearDualNetwork'
+  input_dim: 256  # Must match feature dimension
+  output_dim: 5  # Must match ways/number of classes

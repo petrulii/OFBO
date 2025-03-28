@@ -10,121 +10,139 @@ import time
 # Replay buffer class for storing transitions
 
 class ReplayBuffer:
-  """Buffer to store environment transitions. Discrete actions only"""
-  def __init__(self, obs_shape, capacity):
-    self.capacity = capacity
+    """Buffer to store environment transitions. Discrete actions only"""
+    def __init__(self, obs_shape, capacity):
+        self.capacity = capacity
 
-    self.obses = jnp.empty((capacity, *obs_shape), dtype=jnp.float32)
-    self.next_obses = jnp.empty((capacity, *obs_shape), dtype=jnp.float32)
-    self.actions = jnp.empty((capacity, 1), dtype=jnp.float32)
-    self.rewards = jnp.empty((capacity, 1), dtype=jnp.float32)
-    self.not_dones = jnp.empty((capacity, 1), dtype=jnp.float32)
-    self.not_dones_no_max = jnp.empty((capacity, 1), dtype=jnp.float32)
-    # Add observation times array
-    self.obs_times = jnp.empty((capacity, 1), dtype=jnp.float32)
+        self.obses = jnp.empty((capacity, *obs_shape), dtype=jnp.float32)
+        self.next_obses = jnp.empty((capacity, *obs_shape), dtype=jnp.float32)
+        self.actions = jnp.empty((capacity, 1), dtype=jnp.float32)
+        self.rewards = jnp.empty((capacity, 1), dtype=jnp.float32)
+        self.not_dones = jnp.empty((capacity, 1), dtype=jnp.float32)
+        self.not_dones_no_max = jnp.empty((capacity, 1), dtype=jnp.float32)
+        # Add observation times array
+        self.obs_times = jnp.empty((capacity, 1), dtype=jnp.float32)
 
-    self.idx = 0
-    self.full = False
+        self.idx = 0
+        self.full = False
 
-  def __len__(self):
-    return self.capacity if self.full else self.idx
+    def __len__(self):
+        return self.capacity if self.full else self.idx
 
-  def add(self, obs, action, reward, next_obs, done, done_no_max):
-    
-    self.obses = self.obses.at[self.idx].set(obs)
-    self.actions = self.actions.at[self.idx].set(action)
-    self.rewards = self.rewards.at[self.idx].set(reward)
-    self.next_obses = self.next_obses.at[self.idx].set(next_obs)
-    self.not_dones = self.not_dones.at[self.idx].set(not done)
-    self.not_dones_no_max = self.not_dones_no_max.at[self.idx].set(not done_no_max)
-    # Add current timestamp
-    current_time = time.time()
-    self.obs_times = self.obs_times.at[self.idx].set(current_time)
+    def add(self, obs, action, reward, next_obs, done, done_no_max):
+        """
+        Add a transition to the buffer.
+        """
+        self.obses = self.obses.at[self.idx].set(obs)
+        self.actions = self.actions.at[self.idx].set(action)
+        self.rewards = self.rewards.at[self.idx].set(reward)
+        self.next_obses = self.next_obses.at[self.idx].set(next_obs)
+        self.not_dones = self.not_dones.at[self.idx].set(not done)
+        self.not_dones_no_max = self.not_dones_no_max.at[self.idx].set(not done_no_max)
+        # Add current timestamp
+        current_time = time.time()
+        self.obs_times = self.obs_times.at[self.idx].set(current_time)
 
-    self.idx = (self.idx + 1) % self.capacity
-    self.full = self.full or self.idx == 0
+        self.idx = (self.idx + 1) % self.capacity
+        self.full = self.full or self.idx == 0
 
-  def sample(self, batch_size, replace=False):
-    idxs = np.random.choice(len(self), size=batch_size, replace=replace)
+    def sample(self, batch_size, replace=False):
+        idxs = np.random.choice(len(self), size=batch_size, replace=replace)
 
-    obses = self.obses[idxs]
-    actions = self.actions[idxs]
-    rewards = self.rewards[idxs]
-    next_obses = self.next_obses[idxs]
-    not_dones = self.not_dones[idxs]
-    not_dones_no_max = self.not_dones_no_max[idxs]
-    
-    return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
+        obses = self.obses[idxs]
+        actions = self.actions[idxs]
+        rewards = self.rewards[idxs]
+        next_obses = self.next_obses[idxs]
+        not_dones = self.not_dones[idxs]
+        not_dones_no_max = self.not_dones_no_max[idxs]
 
-  def sample_time_weighted(self, batch_size, decay_factor=0.3, replace=True):
-    """
-    Sample transitions with probability proportional to recency.
-    
-    Args:
-        batch_size: Number of transitions to sample
-        decay_factor: Controls how quickly importance decays with time
-                      Higher values prioritize recent samples more strongly
-        replace: Whether to sample with replacement
+        return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
+
+    def sample_time_weighted(self, batch_size, decay_factor=0.05, replace=True):
+        """
+        Sample transitions with probability proportional to recency.
         
-    Returns:
-        Tuple of batch data including timestamps
-    """
-    buffer_size = len(self)
-    
-    # Calculate time-based sampling weights
-    current_time = time.time()
-    times = self.obs_times[:buffer_size].flatten()
-    relative_times = current_time - times
-    
-    # Compute probabilities using exponential decay
-    # More recent observations get higher probabilities
-    probs = jnp.exp(-decay_factor * relative_times)
-    
-    # Convert to numpy for np.random.choice and normalize
-    probs = np.array(probs)
-    probs = probs / probs.sum()
-    
-    # Sample based on time weights
-    idxs = np.random.choice(buffer_size, size=batch_size, replace=replace, p=probs)
-    
-    # Retrieve sampled transitions
-    obses = self.obses[idxs]
-    actions = self.actions[idxs]
-    rewards = self.rewards[idxs]
-    next_obses = self.next_obses[idxs]
-    not_dones = self.not_dones[idxs]
-    not_dones_no_max = self.not_dones_no_max[idxs]
-    obs_times = self.obs_times[idxs]
-    
-    return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
+        Args:
+            batch_size: Number of transitions to sample
+            decay_factor: Controls how quickly importance decays with time
+                        Higher values prioritize recent samples more strongly
+            replace: Whether to sample with replacement
+        """
+        buffer_size = len(self)
+        
+        # Calculate time-based sampling weights
+        current_time = time.time()
+        times = self.obs_times[:buffer_size].flatten()
+        relative_times = current_time - times
+        
+        # Compute probabilities using exponential decay
+        # More recent observations get higher probabilities
+        probs = jnp.exp(-decay_factor * relative_times)
+        
+        # Convert to numpy for np.random.choice and normalize
+        probs = np.array(probs)
+        probs = probs / probs.sum()
+        
+        # Sample based on time weights
+        idxs = np.random.choice(buffer_size, size=batch_size, replace=replace, p=probs)
+        
+        # Retrieve sampled transitions
+        obses = self.obses[idxs]
+        actions = self.actions[idxs]
+        rewards = self.rewards[idxs]
+        next_obses = self.next_obses[idxs]
+        not_dones = self.not_dones[idxs]
+        not_dones_no_max = self.not_dones_no_max[idxs]
+        obs_times = self.obs_times[idxs]
+        
+        return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
 
-  def save(self, data_path):
-    all_data = [
-      self.obses,
-      self.actions,
-      self.rewards,
-      self.next_obses,
-      self.not_dones,
-      self.not_dones_no_max,
-      self.obs_times  # Save observation times
-    ]
-    pickle.dump(all_data, open(data_path, 'wb'))
+    def save(self, data_path):
+        all_data = [
+        self.obses,
+        self.actions,
+        self.rewards,
+        self.next_obses,
+        self.not_dones,
+        self.not_dones_no_max,
+        self.obs_times  # Save observation times
+        ]
+        pickle.dump(all_data, open(data_path, 'wb'))
         
-  def load(self, data_path):
-    loaded_data = pickle.load(open(data_path, "rb"))
-    # Handle both old format (6 elements) and new format (7 elements)
-    if len(loaded_data) == 7:
-        self.obses, self.actions, self.rewards, self.next_obses, \
-        self.not_dones, self.not_dones_no_max, self.obs_times = loaded_data
-    else:
-        # For backwards compatibility with old saved buffers
-        self.obses, self.actions, self.rewards, self.next_obses, \
-        self.not_dones, self.not_dones_no_max = loaded_data
-        # Initialize observation times for old data
-        self.obs_times = jnp.zeros((len(self.obses), 1), dtype=jnp.float32)
+    def load(self, data_path):
+        loaded_data = pickle.load(open(data_path, "rb"))
+        # Handle both old format (6 elements) and new format (7 elements)
+        if len(loaded_data) == 7:
+            self.obses, self.actions, self.rewards, self.next_obses, \
+            self.not_dones, self.not_dones_no_max, self.obs_times = loaded_data
+        else:
+            # For backwards compatibility with old saved buffers
+            self.obses, self.actions, self.rewards, self.next_obses, \
+            self.not_dones, self.not_dones_no_max = loaded_data
+            # Initialize observation times for old data
+            self.obs_times = jnp.zeros((len(self.obses), 1), dtype=jnp.float32)
+            
+        self.capacity = len(self.obses)
+        self.full = True
+
+    def clear(self):
+        """
+        Empty the replay buffer and reset its state.
+        After calling this method, the buffer will be empty and ready to be filled from scratch.
+        """
+        # Reset all arrays to empty (maintain original shapes and types)
+        obs_shape = self.obses.shape[1:]
+        self.obses = jnp.empty((self.capacity, *obs_shape), dtype=jnp.float32)
+        self.next_obses = jnp.empty((self.capacity, *obs_shape), dtype=jnp.float32)
+        self.actions = jnp.empty((self.capacity, 1), dtype=jnp.float32)
+        self.rewards = jnp.empty((self.capacity, 1), dtype=jnp.float32)
+        self.not_dones = jnp.empty((self.capacity, 1), dtype=jnp.float32)
+        self.not_dones_no_max = jnp.empty((self.capacity, 1), dtype=jnp.float32)
+        self.obs_times = jnp.empty((self.capacity, 1), dtype=jnp.float32)
         
-    self.capacity = len(self.obses)
-    self.full = True
+        # Reset index and full flag
+        self.idx = 0
+        self.full = False
 
 # Evaluation function used in the main training loop
 
@@ -271,3 +289,42 @@ def argmin_bwd_exact(inner_loss, inner_model, solvers, res, g):
 
 # Register custom VJP rules - use either argmin_bwd or argmin_bwd_exact
 inner_solution.defvjp(argmin_fwd, argmin_bwd_exact)
+
+def _average_gradients(self, current_grads):
+    """Average current gradients with past gradients.
+    Args:
+        current_grads: The gradients from the current step
+    Returns:
+        Averaged gradients
+    """
+    # Add current gradients to buffer (non-jitted function)
+    if len(self.grad_buffer) >= self.grad_buffer_size:
+        self.grad_buffer.pop(0)  # Remove oldest gradients
+    
+    # Convert to numpy, store, and convert back to ensure buffer is tractable
+    grad_np = jax.tree_map(lambda x: np.array(x), current_grads)
+    self.grad_buffer.append(grad_np)
+    
+    # Compute weighted average of gradients
+    if len(self.grad_buffer) > 1:
+        # Current gradient gets weight (1-α), past gradients share weight α
+        past_weight = self.grad_avg_weight / len(self.grad_buffer)
+        current_weight = 1.0 - self.grad_avg_weight
+        
+        # Start with weighted current gradient
+        avg_grads = jax.tree_map(lambda x: current_weight * x, current_grads)
+        
+        # Add weighted past gradients
+        for past_grad in self.grad_buffer:
+            # Convert back to jax array
+            past_grad_jax = jax.tree_map(lambda x: jnp.array(x), past_grad)
+            # Add weighted contribution
+            avg_grads = jax.tree_map(
+                lambda avg, past: avg + past_weight * past, 
+                avg_grads, past_grad_jax
+            )
+        
+        return avg_grads
+    else:
+        # If no past gradients, return current gradients
+        return current_grads

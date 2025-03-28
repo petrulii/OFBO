@@ -1,31 +1,22 @@
 import torch
 import numpy as np
 import time
+import wandb
 from funcBO.utils import assign_device, get_dtype, tensor_to_state_dict, state_dict_to_tensor
 from funcBO.InnerSolution import InnerSolution
-from torch.utils.data import DataLoader, Dataset
-from models.models import Task
-from hypergrad.diff_optimizers import GradientDescent
-from utils import split_data, accuracy, fast_adapt
+from torch.utils.data import DataLoader, Dataset, TensorDataset
+from utils import *
+import copy
+import sys
 
-class MetaTaskDataset(Dataset):
-    """Dataset wrapper for meta-learning tasks"""
-    def __init__(self, tasks):
-        self.tasks = tasks
-    
-    def __len__(self):
-        return len(self.tasks)
-    
-    def __getitem__(self, idx):
-        return self.tasks[idx]
 
-class MetaTrainer:
+class Trainer:
     """
     Solves a meta-learning problem using the bilevel functional method.
     """
     def __init__(self, config, logger):
         """
-        Initializes the MetaTrainer class with the provided configuration and logger.
+        Initializes the Trainer class with the provided configuration and logger.
 
         Parameters:
         - config (object): Configuration object containing various settings.
@@ -36,6 +27,11 @@ class MetaTrainer:
         self.device = assign_device(self.args.system.device)
         self.dtype = get_dtype(self.args.system.dtype)
         torch.set_default_dtype(self.dtype)
+        
+        # Set random seed for reproducibility
+        torch.manual_seed(self.args.system.seed)
+        np.random.seed(self.args.system.seed)
+        
         self.build_trainer()
         self.iters = 0
 
@@ -57,298 +53,149 @@ class MetaTrainer:
         """
         device = self.device
 
-        # Setup meta-learning models based on the method
-        if self.args.method == 'funcBO':
-            # In funcBO, meta_model is the head, features are trained
-            from models.models import MetaHead, FeatureExtractor  # Import appropriate models
-            self.meta_model = MetaHead(self.args.head_params).to(device)
-            self.features = FeatureExtractor(self.args.feature_params).to(device)
-        elif self.args.method == 'ANIL':
-            # TODO
-        elif self.args.method == 'MAML':
-            # TODO
-        else:
-            raise ValueError(f"Unsupported method: {self.args.method}")
+        # Create a network for FC100
+        layers = [self.args.network_params.input_dim] + [self.args.network_params.hidden_dim] * self.args.network_params.hidden_layers + [self.args.network_params.output_dim]
+        self.outer_model = nn.Sequential(nn.Flatten(),*[nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)])
+        self.outer_model.to(device)
+        
+        # Create tensor parameters for funcBO
+        self.outer_param = torch.nn.parameter.Parameter(
+            state_dict_to_tensor(self.outer_model, device))
 
         # Create inner model (task-specific model that adapts quickly)
-        self.inner_model = self.meta_model.clone()
+        self.inner_model = copy.deepcopy(self.outer_model)
         self.inner_model.to(device)
         
         # Setup loss function (typically cross-entropy for few-shot classification)
         self.criterion = torch.nn.CrossEntropyLoss()
-        
-        # Create tensor parameters for funcBO
-        self.outer_param = torch.nn.parameter.Parameter(
-            state_dict_to_tensor(self.meta_model, device))
-        
+
         # Setup data
-        # TODO: This would needs to be adjusted
-        from data_utils import get_task_loaders  # Replace with the actual task loading code
-        self.train_tasks, self.val_tasks, self.test_tasks = get_task_loaders(
+        self.inner_dataloader, self.outer_dataloader, self.test_dataloader = get_task_loaders(
             shots=self.args.shots,
             ways=self.args.ways,
             device=device,
-            seed=self.args.seed
+            seed=self.args.system.seed
         )
-        
-        # Create dataloaders
-        self.inner_dataloader = DataLoader(
-            dataset=MetaTaskDataset(self.train_tasks), 
-            batch_size=self.args.batch_size, 
-            shuffle=True)
-        self.outer_dataloader = DataLoader(
-            dataset=MetaTaskDataset(self.train_tasks), 
-            batch_size=self.args.batch_size, 
-            shuffle=True)
-        
-        # Optimizer for outer problem
-        self.outer_optimizer = torch.optim.Adam(
-            [self.outer_param], 
-            lr=self.args.outer_lr, 
-            weight_decay=self.args.outer_wd)
-        
-        # Define inner objective function (adaptation)
-        # !that depends only on the inner prediction!
-        def fi(inner_prediction, target):
+
+        # Setup optimizer for outer problem
+        self.outer_optimizer = torch.optim.Adam([self.outer_param], lr=self.args.outer_lr, weight_decay=self.args.outer_wd)
+
+        # Define inner objective function (task adaptation)
+        def fi(outer_model_outputs, inner_prediction, target):
             """
-            Inner loss: task adaptation loss that depends only on inner model prediction
-            
-            Args:
-                inner_prediction: Output from inner model
-                target: Ground truth labels
+            Inner loss: predict well on a specific task + bias towards outer model outputs (parametric -> outer model parameters)
             """
-            # Calculate loss based only on predictions
-            loss = self.criterion(inner_prediction, target)
-            
+            # Convert to long type (3.0 -> 3)
+            target = target.long()
+            #sys.stderr.write(f"fi - inner_prediction shape: {inner_prediction.shape}, outer_model_outputs shape: {outer_model_outputs.shape}, target shape: {target.shape}\n")
+            # Compute the regularization term first
+            lambda_reg = 0.01  # Hyperparameter to tune
+            reg_term = lambda_reg * F.mse_loss(inner_prediction, outer_model_outputs, reduction='mean')
+            # Compute the loss
+            loss = self.criterion(inner_prediction, target) + reg_term
             return loss
         
         # Define outer objective function (meta-learning)
-        def fo(adapted_model, task_data):
+        def fo(inner_prediction, target):
             """
-            Outer loss: meta-learning loss on evaluation data after adaptation
-            
-            Args:
-                adapted_model: Model after inner adaptation
-                task_data: Data for the task
-            
-            Returns:
-                loss: Loss on evaluation data
+            Outer loss: predict well on all tasks
             """
-            data, labels = task_data
-            
-            # Split data into adaptation and evaluation sets
-            _, _, evaluation_data, evaluation_labels = split_data(
-                data, labels, self.args.shots, self.args.ways, self.device)
-            
-            if self.args.method == 'funcBO' or self.args.method == 'ANIL':
-                evaluation_data = self.features(evaluation_data)
-            
-            # Compute predictions and loss
-            predictions = adapted_model(evaluation_data)
-            loss = self.criterion(predictions, evaluation_labels)
-            
+            loss = self.criterion(inner_prediction, target)
             return loss        
         
         # Store functions
         self.inner_loss = fi
         self.outer_loss = fo
-        self.task_function = task_function
         
-        # Configure inner solver based on your meta-learning approach
-        if self.args.method == 'funcBO' or self.args.method == 'ANIL' or self.args.method == 'MAML':
-            inner_solver_args = {
-                'name': 'funcBO.solvers.GradientSolver',
-                'max_iter': self.args.inner_steps,
-                'tol': 1e-6,
-                'lr': self.args.inner_lr,
-                'momentum': 0.9,
-                'log_freq': 10
-            }
-        else:
-            inner_solver_args = {
-                'name': 'funcBO.solvers.CustomSolver',  # Replace with appropriate solver
-                'max_iter': self.args.inner_steps,
-                'tol': 1e-6,
-                'lr': self.args.inner_lr
-            }
-        
-        # Configure dual solver for computing hypergradients
-        dual_solver_args = {
-            'name': 'funcBO.solvers.ConjugateGradientSolver',
-            'max_iter': 5,
-            'tol': 1e-6,
-            'log_freq': 10
-        }
-        
-        # TODO: Define projector based on your method
-        # !needed when the input is some fancy tuple rather than just an image!
-        def projector(data):
+        # Should return inner_model_inputs, outer_model_inputs, inner_loss_inputs (e.g. z,x,None)
+        def projector(task_data):
             """
-            Extracts and returns the relevant components from the input data.
-
-            Parameters:
-            - data (tuple): A tuple containing input information.
-
-            Returns:
-            - tuple: A tuple containing the relevant components for the inner prediction function.
+            Extracts and returns the input of inner model.
             """
-            image = data
-            return image
+            # Unpack the task data
+            input_data, target = task_data
+            #sys.stderr.write(f"Projector - input_data shape: {input_data.shape}, target shape: {target.shape}\n")
+            return input_data, input_data, target
 
-        # Setup InnerSolution
+        # Setup InnerSolution using config directly
         self.inner_solution = InnerSolution(
-            self.inner_model,
-            self.inner_loss,
-            self.inner_dataloader,
-            projector,
-            self.meta_model,
-            self.outer_param,
-            dual_model_args=None,
-            inner_solver_args=inner_solver_args,
-            dual_solver_args=dual_solver_args
-        )
+            inner_model=self.inner_model,
+            inner_loss=self.inner_loss,
+            inner_dataloader=self.inner_dataloader,
+            inner_data_projector=projector,
+            outer_model=self.outer_model,
+            outer_param=self.outer_param,
+            inner_solver_args=self.args.inner_solver,
+            dual_model_args=self.args.dual_model,
+            dual_solver_args=self.args.dual_solver
+        )                                  
 
     def train(self):
         """
         The main optimization loop for the bilevel functional method for meta-learning.
         """
+        # Initialize wandb
+        wandb.init(project="online_meta_learning", name=self.args.agent_type)
         done = False
         while not done:
-            for task_data in self.outer_dataloader:
+            for outer_data, outer_labels in self.outer_dataloader:
+                # Move data to device
+                outer_data, outer_labels = outer_data.to(self.device), outer_labels.to(self.device)
+                #sys.stderr.write(f"outer_data shape: {outer_data.shape}, outer_labels shape: {outer_labels.shape}\n")
+                
+                # Log metrics
                 metrics_dict = {}
                 metrics_dict['iter'] = self.iters
                 start_time = time.time()
                 
-                # Move data to device if needed
-                data, labels = task_data
-                data, labels = data.to(self.device), labels.to(self.device)
-                task_data = (data, labels)
-                
-                # Get inner solution (adapted model)
-                inner_output = self.inner_solution(task_data)
-                
-                # Compute outer loss
-                loss = self.outer_loss(inner_output, task_data)
+                inner_value = self.inner_solution(outer_data)
+                loss = self.outer_loss(inner_value, outer_labels)
                 
                 # Backpropagation
                 self.outer_optimizer.zero_grad()
                 loss.backward()
                 self.outer_optimizer.step()
-                
-                # Compute accuracy for monitoring
-                _, _, evaluation_data, evaluation_labels = split_data(
-                    data, labels, self.args.shots, self.args.ways, self.device)
-                
-                if self.args.method == 'funcBO' or self.args.method == 'ANIL':
-                    evaluation_data = self.features(evaluation_data)
-                
-                predictions = inner_output(evaluation_data)
-                eval_accuracy = accuracy(predictions, evaluation_labels)
-                
-                # Logging
+
+                # Log outer optimization details
                 metrics_dict['outer_loss'] = loss.item()
-                metrics_dict['accuracy'] = eval_accuracy.item()
-                metrics_dict['time'] = time.time() - start_time
+                wandb.log(metrics_dict)
                 
+                # Log inner optimization details if available
                 inner_logs = self.inner_solution.inner_solver.data_logs if hasattr(self.inner_solution.inner_solver, 'data_logs') else None
                 if inner_logs:
-                    self.log_metrics_list(inner_logs, self.iters, log_name='inner_metrics')
-                
+                    # Log only the final inner iteration loss
+                    final_log = inner_logs[-1] if inner_logs else {}
+                    wandb.log({'inner_loss': final_log.get('loss', 0), 'iter': self.iters})
+
+                # Log dual optimization details if available
                 dual_logs = self.inner_solution.dual_solver.data_logs if hasattr(self.inner_solution.dual_solver, 'data_logs') else None
                 if dual_logs:
-                    self.log_metrics_list(dual_logs, self.iters, log_name='dual_metrics')
+                    final_log = dual_logs[-1] if dual_logs else {}
+                    wandb.log({'dual_loss': final_log.get('loss', 0), 'iter': self.iters})
                 
-                self.log(metrics_dict)
-                print(f"Iter {self.iters}: Loss={loss.item():.4f}, Accuracy={eval_accuracy.item():.4f}")
-                
+                # Increment iteration counter
                 self.iters += 1
+                
+                # Check if we've reached the maximum number of epochs
                 done = (self.iters >= self.args.max_epochs)
+                """if self.iters % 100 == 0 or done:
+                    # Evaluate on validation set occasionally
+                    val_loss, val_acc = self.evaluate(data_type="validation")
+                    val_log = [{'inner_iter': 0, 'val_loss': val_loss.item(), 'val_accuracy': val_acc.item()}]
+                    self.log_metrics_list(val_log, self.iters, log_name='val_metrics')
+                    wandb.log({'val_accuracy': val_acc.item()})"""
+                
                 if done:
                     break
-        
-        # Evaluate after training
-        val_loss, val_acc = self.evaluate(data_type="validation")
-        val_log = [{'inner_iter': 0, 'val_loss': val_loss.item(), 'val_accuracy': val_acc.item()}]
-        self.log_metrics_list(val_log, 0, log_name='val_metrics')
-        
-        test_loss, test_acc = self.evaluate(data_type="test")
-        test_log = [{'inner_iter': 0, 'test_loss': test_loss.item(), 'test_accuracy': test_acc.item()}]
-        self.log_metrics_list(test_log, 0, log_name='test_metrics')
 
     def evaluate(self, data_type="validation"):
         """
         Evaluates the meta-model on the given data type.
-        
-        Parameters:
-        - data_type (str): Type of data to evaluate on ("validation" or "test").
-        
-        Returns:
-        - tuple: (average_loss, average_accuracy) on the provided data.
         """
         tasks = self.val_tasks if data_type == "validation" else self.test_tasks
         
-        # Store previous training states
-        previous_state_meta_model = self.meta_model.training
-        previous_state_inner_solution = self.inner_solution.training
-        previous_state_inner_model = self.inner_model.training
-        if hasattr(self, 'features') and not callable(self.features):
-            previous_state_features = self.features.training
-            self.features.eval()
-        
         # Set models to evaluation mode
-        self.meta_model.eval()
-        self.inner_solution.eval()
+        self.outer_model.eval()
         self.inner_model.eval()
         
-        total_loss = 0.0
-        total_accuracy = 0.0
-        num_tasks = len(tasks)
-        
-        with torch.no_grad():
-            for task in tasks:
-                # Get task data
-                data, labels = task
-                data, labels = data.to(self.device), labels.to(self.device)
-                
-                # Perform fast adaptation using the appropriate method
-                evaluation_error, evaluation_accuracy = fast_adapt(
-                    self.args.method,
-                    (data, labels),
-                    self.meta_model.clone(),  # Clone for each task
-                    self.features,
-                    self.criterion,
-                    self.args.shots,
-                    self.args.ways,
-                    self.args.inner_steps,
-                    self.args.reg_lambda,
-                    self.device
-                )
-                
-                total_loss += evaluation_error.item()
-                total_accuracy += evaluation_accuracy.item()
-        
-        # Restore previous training states
-        self.meta_model.train(previous_state_meta_model)
-        self.inner_solution.train(previous_state_inner_solution)
-        self.inner_model.train(previous_state_inner_model)
-        if hasattr(self, 'features') and not callable(self.features):
-            self.features.train(previous_state_features)
-        
-        avg_loss = total_loss / num_tasks
-        avg_accuracy = total_accuracy / num_tasks
-        
-        return torch.tensor(avg_loss, device=self.device), torch.tensor(avg_accuracy, device=self.device)
-    
-    def get_inner_opt(self, train_loss):
-        """
-        Creates an inner optimizer as used in trainer_meta.py.
-        
-        Args:
-            train_loss: The training loss function
-            
-        Returns:
-            inner_opt: The inner optimizer
-        """
-        inner_opt_class = GradientDescent
-        inner_opt_kwargs = {'step_size': self.args.inner_lr}
-        return inner_opt_class(train_loss, **inner_opt_kwargs)
+        # TODO: Implement evaluation code

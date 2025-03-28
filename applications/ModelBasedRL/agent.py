@@ -35,6 +35,10 @@ class Agent:
         self.obs_dim = obs_space.shape[0]
         self.action_dim = action_space.n
         self.obs_range = (obs_space.low, obs_space.high)
+        if self.args.average_hypergradients:
+            self.grad_buffer = []
+            self.grad_buffer_size = self.args.grad_buffer_size
+            self.grad_avg_weight = self.args.grad_avg_weight
         
         # Example observations for network initialization
         demo_obs = jnp.ones((1, self.obs_dim))
@@ -541,6 +545,59 @@ class Agent:
             aux_out.target_params_Q, aux_out.opt_state_Q, aux_out.next_obs_nll
         )
     
+    #@partial(jax.jit, static_argnums=(0,6))
+    def update_step_outer_averaged(self, params_T, aux_params, opt_state_T, batch, replay, loss):
+        """Outer update step for world model with gradient averaging."""
+        # Compute gradients normally
+        (value, aux_out), grads = value_and_grad(loss, has_aux=True)(
+            params_T, aux_params, batch, replay)
+        
+        # Store current gradient in buffer (using host callback to avoid JIT issues)
+        def store_grad(grads):
+            # Convert to numpy to store
+            grad_np = jax.tree_map(lambda x: jnp.array(x), grads)
+            # Remove oldest if buffer is full
+            if len(self.grad_buffer) >= self.grad_buffer_size:
+                self.grad_buffer.pop(0)
+            # Add current gradient
+            self.grad_buffer.append(grad_np)
+            return 0  # Return value not used
+        
+        # Use host callback to modify the buffer (breaks JIT but unavoidable)
+        store_grad(grads)
+        
+        # Compute weighted average gradient
+        if len(self.grad_buffer) > 1:
+            past_weight = self.grad_avg_weight / len(self.grad_buffer)
+            current_weight = 1.0 - self.grad_avg_weight
+            
+            # Start with weighted current gradient
+            avg_grads = jax.tree_map(lambda x: current_weight * x, grads)
+            
+            # Add weighted past gradients
+            for past_grad in self.grad_buffer:
+                past_grad_jax = jax.tree_map(lambda x: jnp.array(x), past_grad)
+                avg_grads = jax.tree_map(
+                    lambda avg, past: avg + past_weight * past, 
+                    avg_grads, past_grad_jax
+                )
+        else:
+            avg_grads = grads
+        
+        # Apply averaged gradients
+        updates, opt_state_T = self.T.opt.update(avg_grads, opt_state_T)
+        new_params = optax.apply_updates(params_T, updates)
+        
+        # Define output structure
+        UpdOut = namedtuple('Upd_outer', 
+            'loss_T params_T opt_state_T loss_Q vals_Q grad_norm_Q entropy_Q params_Q target_params_Q opt_state_Q next_obs_nll')
+            
+        return UpdOut(
+            value, new_params, opt_state_T, aux_out.loss_Q, 
+            aux_out.vals_Q, aux_out.grad_norm_Q, aux_out.entropy_Q, aux_out.params_Q, 
+            aux_out.target_params_Q, aux_out.opt_state_Q, aux_out.next_obs_nll
+        )
+
     @partial(jax.jit, static_argnums=(0,6))
     def update_step(self, params, aux_params, opt_state, batch, replay, loss_type):
         """General update step based on loss type."""
@@ -605,8 +662,11 @@ class Agent:
     def update(self, replay_buffer):
         """Main update method for training."""
         # Sample from replay buffer
-        replay = replay_buffer.sample_time_weighted(self.args.batch_size)
-        
+        if self.args.time_weighted_sampling:
+            replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+        else:
+            replay = replay_buffer.sample(self.args.batch_size)
+
         # Different update strategies based on agent type
         if self.args.agent_type in ['omd', 'funcBO']:
             if self.args.agent_type == 'omd':
@@ -635,33 +695,31 @@ class Agent:
             # Batch is None for these methods
             batch = None
             
-            # Update with outer loop optimization
-            updout = self.update_step_outer(
-                self.params_T, aux_params, self.opt_state_T, 
-                batch, replay, outer_loss
-            )
+            # Update world model
+            if self.args.average_hypergradients:
+                # Update with outer loop optimization and gradient averaging
+                updout_T = self.update_step_outer_averaged(self.params_T, aux_params, self.opt_state_T, batch, replay, outer_loss)
+            else:
+                # Update with outer loop optimization
+                updout_T = self.update_step_outer(self.params_T, aux_params, self.opt_state_T, batch, replay, outer_loss)
             
             # Update agent parameters
-            self.params_Q, self.opt_state_Q = updout.params_Q, updout.opt_state_Q
-            self.target_params_Q = updout.target_params_Q
-            self.params_T, self.opt_state_T = updout.params_T, updout.opt_state_T
-            
-            # Return metrics
-            return {
-                'loss_T': updout.loss_T.item(), 
-                'vals_Q': updout.vals_Q.item(), 
-                'loss_Q': updout.loss_Q.item(), 
-                'grad_norm_Q': updout.grad_norm_Q.item(), 
-                'entropy_Q': updout.entropy_Q.item(),
-                'next_obs_nll': updout.next_obs_nll.item()
-            }
+            self.params_Q, self.opt_state_Q = updout_T.params_Q, updout_T.opt_state_Q
+            self.target_params_Q = updout_T.target_params_Q
+            self.params_T, self.opt_state_T = updout_T.params_T, updout_T.opt_state_T
+
+            # For logging
+            #updout_Q = updout_T
             
         elif self.args.agent_type == 'mle':
             # Maximum likelihood estimation
             # Update world model
             for i in range(self.args.num_T_steps):
                 aux_params = AuxP(None, None, None, next(self.rngs))
-                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                if self.args.time_weighted_sampling:
+                    replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                else:
+                    replay = replay_buffer.sample(self.args.batch_size)
                 updout_T = self.update_step(
                     self.params_T, aux_params, self.opt_state_T, 
                     None, replay, 'mle'
@@ -670,7 +728,10 @@ class Agent:
             
             # Update Q-function
             for i in range(self.args.num_Q_steps):
-                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                if self.args.time_weighted_sampling:
+                    replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                else:
+                    replay = replay_buffer.sample(self.args.batch_size)
                 replay_model, nll = self.batch_real_to_model(
                     self.params_T, replay, next(self.rngs)
                 )
@@ -681,21 +742,15 @@ class Agent:
                 self.params_Q, self.opt_state_Q = updout_Q.params_Q, updout_Q.opt_state_Q
                 self.target_params_Q = self._soft_update_params(self.params_Q, self.target_params_Q)
             
-            # Return metrics
-            return {
-                'loss_T': updout_T.loss_T.item(), 
-                'vals_Q': updout_Q.vals_Q.item(), 
-                'loss_Q': updout_Q.loss_Q.item(), 
-                'grad_norm_Q': updout_Q.grad_norm_Q.item(), 
-                'entropy_Q': updout_Q.entropy_Q.item()
-            }
-            
         elif self.args.agent_type == 'vep':
             # Value-equivalent prediction
             # Update world model
             for i in range(self.args.num_T_steps):
                 aux_params = AuxP(self.params_V, None, None, next(self.rngs))
-                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                if self.args.time_weighted_sampling:
+                    replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                else:
+                    replay = replay_buffer.sample(self.args.batch_size)
                 updout_T = self.update_step(
                     self.params_T, aux_params, self.opt_state_T, 
                     None, replay, 'vep'
@@ -704,7 +759,10 @@ class Agent:
             
             # Update Q-function
             for i in range(self.args.num_Q_steps):
-                replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                if self.args.time_weighted_sampling:
+                    replay = replay_buffer.sample_time_weighted(self.args.batch_size)
+                else:
+                    replay = replay_buffer.sample(self.args.batch_size)
                 replay_model, nll = self.batch_real_to_model(
                     self.params_T, replay, next(self.rngs)
                 )
@@ -714,13 +772,12 @@ class Agent:
                 )
                 self.params_Q, self.opt_state_Q = updout_Q.params_Q, updout_Q.opt_state_Q
                 self.target_params_Q = self._soft_update_params(self.params_Q, self.target_params_Q)
-            
-            # Return metrics
-            return {
-                'loss_T': updout_T.loss_T.item(), 
-                'vals_Q': updout_Q.vals_Q.item(), 
-                'loss_Q': updout_Q.loss_Q.item(), 
-                'grad_norm_Q': updout_Q.grad_norm_Q.item(), 
-                'entropy_Q': updout_Q.entropy_Q.item(),
-                'next_obs_nll': updout_T.next_obs_nll.item()
-            }
+
+        # Return metrics
+        #return {
+        #    'loss_T': updout_T.loss_T.item(), 
+        #    'vals_Q': updout_Q.vals_Q.item(), 
+        #    'loss_Q': updout_Q.loss_Q.item(), 
+        #    'grad_norm_Q': updout_Q.grad_norm_Q.item(), 
+        #    'entropy_Q': updout_Q.entropy_Q.item()
+        #}

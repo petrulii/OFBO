@@ -1,27 +1,63 @@
-env_name:  'CartPole-v1'
+##### Main training loop configuration #####
+
 seed: 0
 num_train_steps: 200000
-buffer_capacity: 200000
-hidden_dim: 32
-model_hidden_dim: 3
 batch_size: 256
-init_steps: 1000
 eval_frequency: 1000
 log_frequency: 1000
+agent_type: 'funcBO'
+
+##### Sampling from environment hyperparameters #####
+
+time_weighted_sampling: False
+
+##### Environment configuration #####
+
+env_name: 'CartPole-v1'
+init_steps: 1000
+buffer_capacity: 20000
+non_stationary: False
+end_transition_clear_buffer: False
+transition_duration: 20000
+plateau_duration: 30000
+average_hypergradients: False
+grad_buffer_size: 100
+# Hypergradient averaging weight - controls the influence of past gradients
+# Higher: more stability but slower adaptation; Lower: faster adaptation but more noise
+grad_avg_weight: 0.1
+
+##### Model configuration #####
+
+hidden_dim: 32
+model_hidden_dim: 32
+
+##### Bilevel optimization configuration #####
+
 num_Q_steps: 1
 num_T_steps: 1
 num_dual_Q_steps: 1
 num_ensemble_vep: 5
-eps: 0.1
-discount: 0.99
 lr: 0.001
 inner_lr: 0.0003
 dual_lr: 0.0003
+
+##### Averaging and discount factor hyperparameters #####
+
+# Epsilon for exploration - probability of taking a random action
+# Higher: more exploration; Lower: more exploitation of current policy
+eps: 0.1
+# Discount factor - determines how much future rewards are valued
+# Higher: more far-sighted behavior; Lower: more immediate reward focus
+discount: 0.99
+# Temperature parameter for soft Q-learning - controls policy entropy
+# Higher: more exploration and smoother policy; Lower: more deterministic policy
 alpha: 0.01
+# Soft update rate for target networks - controls update speed of target networks
+# Higher: faster tracking of online network; Lower: more stable learning targets
 tau: 0.01
-non_stationary: True
-change_frequency: 10000
-amplitude: 0.5
+
+##### Other hyperparameters #####
+
 save_buf: False
 save_agent: False
 hard: False
@@ -30,6 +66,3 @@ no_warm: False
 warm_opt: False
 no_double: False
 with_inv_jac: False
-
-agent_type: 'funcBO'
-

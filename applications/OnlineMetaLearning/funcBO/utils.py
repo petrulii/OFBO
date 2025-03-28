@@ -55,33 +55,37 @@ def set_device_and_type(data,device, dtype):
     raise NotImplementedError('unknown type')
 
 
-
 class RingGenerator:
   def __init__(self, init_generator, device, dtype):
     self.init_generator = init_generator
-    self.generator = None
-    self.device= device
+    self.device = device
     self.dtype = dtype
-  # def make_generator(self):
-  #   return iter(self.init_generator)
-
+    self.generator = self.make_generator()  # Initialize generator immediately
+    
   def make_generator(self):
-    return (set_device_and_type(data,self.device,self.dtype) for data in self.init_generator)
+    return (set_device_and_type(data, self.device, self.dtype) for data in self.init_generator)
+  
   def __next__(self, *args):
     try:
       return next(self.generator)
-    except:
+    except (StopIteration, TypeError):  # Handle both StopIteration and potential TypeError
       self.generator = self.make_generator()
       return next(self.generator)
+  
   def __iter__(self):
     return self.make_generator()
 
   def __getstate__(self):
     return {'init_generator': self.init_generator,
-        'generator': None}
-  def __setstate__(self, d ):
+            'device': self.device,
+            'dtype': self.dtype,
+            'generator': None}
+  
+  def __setstate__(self, d):
     self.init_generator = d['init_generator']
-    self.generator = None
+    self.device = d.get('device')  # Get with default None in case of old pickles
+    self.dtype = d.get('dtype')    # Get with default None in case of old pickles
+    self.generator = None  # Will be initialized on next call to __next__
 
 
 def compute_batch_hessian(inner_loss, outer_model_outputs, 
