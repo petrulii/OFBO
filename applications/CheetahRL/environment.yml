@@ -1,0 +1,52 @@
+name: mbrl_mujoco
+channels:
+  - conda-forge
+  - defaults
+  - pytorch
+dependencies:
+  # Using Python 3.8 from mujoco_env instead of 3.11 from mbrl for better compatibility
+  - python=3.8
+  # Key system packages
+  - pip=21.0.1  # Using version from mujoco_env
+  - bzip2
+  - ca-certificates
+  - libffi
+  # Base scientific packages with specific versions from mujoco_env
+  - numpy=1.20.2
+  - scipy=1.6.0
+  - pip:
+    # MuJoCo installation
+    - mujoco  # Using PyPI version as recommended in your notes
+    
+    # Core libraries from mujoco_env
+    - absl-py==0.12.0  # Using older version for compatibility
+    - gym==0.21.0  # Using older version from mujoco_env for better compatibility
+    - gdown
+    - termcolor
+    - tqdm==4.60.0  # Using version from mujoco_env
+    
+    # JAX ecosystem from mujoco_env (older, but more tested with MuJoCo)
+    - flax==0.3.3
+    - jax==0.2.9
+    - jaxlib==0.1.59
+    - ml_collections==0.1.0
+    - optax==0.0.6
+    - distrax==0.0.1
+    
+    # Visualization and logging
+    - imageio==2.9.0
+    - imageio-ffmpeg==0.4.3
+    - tensorboardX==2.2
+    - tensorboard==2.5.0
+    
+    # Extra packages from mbrl that don't conflict
+    - cloudpickle
+    - pyyaml
+    - typing-extensions
+    - urllib3
+    - wandb
+    - pandas
+    
+    # GitHub repositories
+    #- git+https://github.com/gehring/fax.git
+    #- git+https://github.com/deepmind/dm-haiku.git
