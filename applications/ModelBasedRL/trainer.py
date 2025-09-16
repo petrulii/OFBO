@@ -1,5 +1,6 @@
 import os
-import gym
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
 import time
 import haiku as hk
@@ -7,9 +8,13 @@ import jax
 import math
 
 from agent import Agent
-from utils import ReplayBuffer, evaluate
+from utils import ReplayBuffer
 
 import wandb
+
+import os
+import imageio
+from PIL import Image
 
 class Trainer:
     """
@@ -27,12 +32,13 @@ class Trainer:
         self.logger = logger
         self.build_trainer()
         # Initialize wandb run with name which includes config.agent_type+non_stationary+end_transition_clear_buffer+model_hidden_dim where some are boolean and model_hidden_dim is an integer, also buffer capacity, inner_lr and tau two real values
-        custom_name = f"{self.config.agent_type}_{'non_stationary' if self.config.non_stationary else 'stationary'}_{self.config.model_hidden_dim}_{self.config.buffer_capacity}_{self.config.inner_lr}_{self.config.tau}"
-        wandb.init(project="cartpole_omd", job_type="train", name=custom_name)
+        custom_name = f"{self.config.agent_type}_{'n_st' if self.config.non_stationary else 'st'}_{self.config.model_hidden_dim}_{self.config.inner_lr}_{self.config.tau}_{self.config.alpha}_{self.config.grad_buffer_size}_{self.config.beta}"
+        wandb.init(project="cartpole_nips", job_type="train", name=custom_name, config=self.config)
     
     def build_trainer(self):
         """Initialize environment, agent, and replay buffer."""
-        # Create environments
+
+        # Create environments and wrap to handle cart position wrapping
         self.env = gym.make(self.config.env_name)
         self.eval_env = gym.make(self.config.env_name)
         
@@ -56,10 +62,22 @@ class Trainer:
         self.episode_return = 0
         self.episode_step = 0
 
-        # Non-stationary environment settings
-        self.base_masscart = self.env.unwrapped.masscart # Store the original mass values
-        self.base_masspole = self.env.unwrapped.masspole
-        self.masscart = self.base_masscart
+        # Create directory for GIFs
+        if self.config.video_frequency > 0:
+            self.video_dir = os.path.join(wandb.run.dir, "videos")
+            os.makedirs(self.video_dir, exist_ok=True)
+        
+        # Initialize optimal interval for non-stationary reward
+        # The pole angle can be observed between (-.418, .418) radians (or ±24°)
+        # but the episode terminates if the pole angle is not in the range (-.2095, .2095) (or ±12°)
+        # We want 3 optimal intervals inside the range (-.2095, .2095)
+        #self.opt_intervals = [(-0.2095, -0.01), (0.01, 0.2095)]
+        self.interval_indices = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+        #self.opt_intervals = [(-0.06, 0.06), (-0.2095, -0.06), (0.06, 0.2095)]
+        self.opt_intervals = [(-0.2095, 0.06), (-0.06, 0.2095)]
+        #self.interval_indices = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]
+        idx = 0
+        self.opt_interval = self.opt_intervals[idx]  # Initialize with the first interval
     
     def train(self):
         """
@@ -84,14 +102,19 @@ class Trainer:
 
             self.step += 1
 
-            # If the environment is non-stationary, update mass
-            if self.config.non_stationary:
-                self.masscart = self.update_mass()
-            
+            # If the environment is non-stationary, update opt_interval
+            self.opt_interval = self.update_interval()
+            #if self.config.non_stationary and (self.step % self.config.opt_interval_update_freq == 0):
+                # Periodically pick one of the three intervals
+                #self.opt_interval = self.opt_intervals[self.interval_indices[idx]]
+                #idx = idx + 1
+                #if idx >= len(self.interval_indices):
+                #    idx = 0
+
             # Periodically evaluate agent
             if self.step % self.config.eval_frequency == 0:
                 # Passing random generator to ensure reproducibility
-                eval_return = evaluate(self.agent, self.eval_env, next(self.rngs), masscart=self.masscart)
+                eval_return = evaluate(self.agent, self.eval_env, next(self.rngs), self.opt_interval)
                 eval_time = time.time()
                 
                 wandb.log({
@@ -101,6 +124,23 @@ class Trainer:
                 }, step=self.step)
                 
                 last_eval_time = eval_time
+
+            # Periodically render and save GIF
+            if self.config.video_frequency > 0 and self.step % self.config.video_frequency == 0:
+                # Create a separate environment for rendering
+                render_env = gym.make(self.config.env_name, render_mode="rgb_array")
+                
+                # Generate filename with step number
+                gif_filename = os.path.join(self.video_dir, f"step_{self.step:07d}.gif")
+                
+                # Create GIF and log to wandb
+                _ = create_gif(self.agent, render_env, gif_filename, self.opt_interval)
+                
+                # Log to wandb
+                wandb.log({"video": wandb.Video(gif_filename, fps=30, format="gif")}, step=self.step)
+                
+                # Close the rendering environment
+                render_env.close()
             
             # Select action (with epsilon-greedy exploration)
             if np.random.rand() < self.config.eps or self.step < self.config.init_steps:
@@ -115,10 +155,17 @@ class Trainer:
             done_float = float(done)
             # Allow infinite bootstrap if termination is due to time limit
             done_no_max = 0 if truncated else done_float
+
+            # Get pole angle from observation
+            pole_angle = next_obs[2]
             
+            # Scale reward if pole is in optimal interval
+            if not (self.opt_interval[0] <= pole_angle <= self.opt_interval[1]):
+                reward = 0
+
             # Track episode return
             self.episode_return += reward
-            
+
             # Store transition in replay buffer
             self.replay_buffer.add(obs, action, reward, next_obs, done_float, done_no_max)
             
@@ -132,7 +179,9 @@ class Trainer:
                 wandb.log({
                     'train/avg_episode_reward': self.episode_return,
                     'train/time': time.time() - start_time,
-                    'train/cart_mass': self.env.unwrapped.masscart
+                    'train/opt_interval_a': self.opt_interval[0],
+                    'train/opt_interval_b': self.opt_interval[1],
+                    'train/pole_angle': pole_angle
                 }, step=self.step)
                 
                 # Reset environment and episode tracking
@@ -149,98 +198,144 @@ class Trainer:
             # Start training after init_steps and when not in warmup period
             if self.step >= self.config.init_steps and (not hasattr(self, 'need_warmup') or not self.need_warmup):
                 # Update agent
-                self.agent.update(self.replay_buffer)
+                model_grad_norm, Q_grad_norm, model_loss, Q_loss = self.agent.update(self.replay_buffer)
+                # Log training metrics
+                wandb.log({
+                    'train/model_grad_norm': model_grad_norm,
+                    'train/Q_grad_norm': Q_grad_norm,
+                    'train/model_loss': model_loss,
+                    'train/Q_loss': Q_loss
+                }, step=self.step)
         
         # Final evaluation with more episodes
-        final_eval_return = evaluate(self.agent, self.eval_env, next(self.rngs), num_eval_episodes=20, masscart=self.masscart)
+        final_eval_return = evaluate(self.agent, self.eval_env, next(self.rngs), self.opt_interval, num_eval_episodes=20)
         
-        wandb.log({
-            'eval/final_episode_return': final_eval_return
-        }, step=self.step)
+        wandb.log({'eval/final_episode_return': final_eval_return}, step=self.step)
         
         wandb.finish()
 
         return final_eval_return
 
-    def update_mass(self):
-        """Update cart mass to transition smoothly between discrete plateaus."""
-        # Initialize on first call
-        if not hasattr(self, 'plateau_values'):
-            # Example: 2 different plateau values at 0.5 and 1.5 times base mass
-            self.plateau_values = [1.5, 0.5, 1.5, 0.5, 1.5, 0.5]
-            
-            # Start at the first plateau
-            self.current_plateau_idx = 0
-            
-            # Initial mass setting
-            self.current_mass = self.base_masscart * self.plateau_values[self.current_plateau_idx]
-            
-            # Transition parameters
-            self.transition_steps = self.config.transition_duration
-            self.steps_in_transition = 0
-            self.steps_on_plateau = 0
-            self.plateau_duration = self.config.plateau_duration
+    def update_interval(self):
+        """
+        Updates the optimal interval for reward scaling.
 
-            # Warmup tracking
-            self.need_warmup = False
-            self.warmup_steps = 0
-            self.warmup_size = self.config.batch_size * 2  # Number of samples to collect before resuming training
-            
-            # Set initial mass
-            self.env.unwrapped.masscart = self.current_mass
-            return self.env.unwrapped.masscart
-        
-        # Check if we need to start a new transition
-        if self.steps_in_transition == 0 and self.steps_on_plateau >= self.plateau_duration:
-            # Reset plateau counter
-            self.steps_on_plateau = 0
-            
-            # Store current mass as starting point and calculate target
-            self.current_mass = self.env.unwrapped.masscart  # Use actual current mass
-            self.target_mass = self.base_masscart * self.plateau_values[self.current_plateau_idx+1]
-            
-            self.steps_in_transition = 1  # Start transition
+        For non-stationary environments, linearly progresses from interval 0 to interval 1
+        over the course of the training period (no oscillation).
 
-        elif self.steps_in_transition > 0:
-            # We're in a transition between plateaus
-            if self.steps_in_transition <= self.transition_steps:
-                # Calculate smooth transition using sigmoid function
-                progress = self.steps_in_transition / self.transition_steps
-                # Sigmoid gives a smooth S-curve transition
-                smoothed_progress = 1.0 / (1.0 + math.exp(-10 * (progress - 0.5)))
-                
-                # Interpolate between current and target mass
-                new_mass = self.current_mass + smoothed_progress * (self.target_mass - self.current_mass)
+        Returns:
+            tuple: The current optimal interval (min, max)
+        """
+        if not self.config.non_stationary:
+            return self.opt_intervals[0]
 
-                self.env.unwrapped.masscart = new_mass
-                self.steps_in_transition += 1
-                
-                # If transition completed, reset counter
-                if self.steps_in_transition > self.transition_steps:
-                    self.steps_in_transition = 0
-                    self.steps_on_plateau = 0
+        # Linear progress from 0 to 1
+        progress = min(1.0, self.step / self.config.num_train_steps)
 
-                    # Update the plateau index
-                    self.current_plateau_idx = (self.current_plateau_idx + 1) % len(self.plateau_values)
-                
-                    if self.config.end_transition_clear_buffer:
-                        # Clear the replay buffer when reaching a new plateau by creating a new one
-                        self.replay_buffer = ReplayBuffer(self.env.observation_space.shape, self.config.buffer_capacity)
-                    
-                    # Set warmup flag to avoid training until buffer has enough samples
-                    self.need_warmup = True
-                    self.warmup_steps = 0
-        else:
-            # We're on a plateau - mass stays constant
-            self.steps_on_plateau += 1
-        
-        # Update total mass
-        self.env.unwrapped.total_mass = self.env.unwrapped.masscart + self.env.unwrapped.masspole
-        
-        # If we need warmup after buffer clear, increment counter
-        if self.need_warmup:
-            self.warmup_steps += 1
-            if self.warmup_steps >= self.warmup_size:
-                self.need_warmup = False
+        interval_0 = self.opt_intervals[0]
+        interval_1 = self.opt_intervals[1]
+
+        min_val = (1 - progress) * interval_0[0] + progress * interval_1[0]
+        max_val = (1 - progress) * interval_0[1] + progress * interval_1[1]
+
+        return (min_val, max_val)
+
+
+def evaluate(agent, eval_env, rng, opt_interval, num_eval_episodes=10):
+    """Evaluate the agent's performance in the environment."""
+    average_episode_reward = 0
+    for episode in range(num_eval_episodes):
+        obs, _ = eval_env.reset()
+        done, truncated = False, False
+        episode_reward = 0
+        while not (done or truncated):
+            rng, _ = jax.random.split(rng)
+            action = agent.act(agent.params_Q, obs, rng).item()
+            obs, reward, done, truncated, info = eval_env.step(action)
+            # Get pole angle from observation
+            pole_angle = obs[2]
+            
+            # Scale reward if pole is in optimal interval
+            if not (opt_interval[0] <= pole_angle <= opt_interval[1]):
+                reward = 0
+            
+            episode_reward += reward
+        average_episode_reward += episode_reward
+    average_episode_reward /= num_eval_episodes
+    return average_episode_reward
+
+
+# Video rendering function
+def create_gif(agent, env, filename, opt_interval, max_steps=500):
+    """
+    Renders a single episode of the agent's performance and saves it as a GIF.
     
-        return self.env.unwrapped.masscart
+    Parameters:
+    - agent: The RL agent
+    - env: The environment
+    - filename: Where to save the GIF
+    - opt_interval: Optional interval for reward scaling
+    - max_steps: Maximum number of steps to render
+    
+    Returns:
+    - episode_reward: Total reward accumulated during the episode
+    """
+    # Reset environment
+    obs, _ = env.reset()
+    done, truncated = False, False
+    episode_reward = 0
+    
+    # Create directory for frames if it doesn't exist
+    frames_dir = os.path.join(os.path.dirname(filename), "temp_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    
+    # Lists to store frames and rewards
+    frames = []
+    rewards = []
+    
+    # Render initial frame
+    frame = env.render()
+    frames.append(frame)
+    
+    step = 0
+    
+    # Loop until episode ends or max steps reached
+    while not (done or truncated) and step < max_steps:
+        # Select action
+        action = agent.act(agent.params_Q, obs, jax.random.PRNGKey(0)).item()
+        
+        # Execute action
+        obs, reward, done, truncated, info = env.step(action)
+        # Get pole angle from observation
+        pole_angle = obs[2]
+        
+        # Scale reward if pole is in optimal interval
+        if not (opt_interval[0] <= pole_angle <= opt_interval[1]):
+            reward = 0
+        
+        episode_reward += reward
+        rewards.append(reward)
+        
+        # Render frame and append to list
+        frame = env.render()
+        frames.append(frame)
+        
+        step += 1
+    
+    # Save frames as GIF
+    imageio.mimsave(filename, frames, fps=30)
+    
+    # Clean up temporary files
+    for i, frame in enumerate(frames):
+        frame_path = os.path.join(frames_dir, f"frame_{i:05d}.png")
+        try:
+            os.remove(frame_path)
+        except:
+            pass
+    
+    try:
+        os.rmdir(frames_dir)
+    except:
+        pass
+    
+    return episode_reward

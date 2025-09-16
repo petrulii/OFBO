@@ -268,7 +268,7 @@ def argmin_bwd_exact(inner_loss, inner_model, solvers, res, g):
     return z_sol, jax.tree_map(lambda x: -x, vdp), z_replay, z_rng, z_dual
 
 # Register custom VJP rules - use either argmin_bwd or argmin_bwd_exact
-inner_solution.defvjp(argmin_fwd, argmin_bwd_exact)
+inner_solution.defvjp(argmin_fwd, argmin_bwd)
     
 class GradientBufferManager:
     def __init__(self, buffer_size, grad_example):

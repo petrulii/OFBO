@@ -6,6 +6,11 @@ batch_size: 256
 eval_frequency: 1000
 log_frequency: 1000
 agent_type: 'funcBO'
+video_frequency: 10000
+
+##### Non-stationary environment configuration #####
+reward_scale_value: 1
+opt_interval_update_freq: 10000
 
 ##### Sampling from environment hyperparameters #####
 
@@ -21,10 +26,10 @@ end_transition_clear_buffer: False
 transition_duration: 20000
 plateau_duration: 30000
 average_hypergradients: False
-grad_buffer_size: 100
+grad_buffer_size: 1000
 # Hypergradient averaging weight - controls the influence of past gradients
 # Higher: more stability but slower adaptation; Lower: faster adaptation but more noise
-grad_avg_weight: 0.1
+beta: 0.3
 
 ##### Model configuration #####
 

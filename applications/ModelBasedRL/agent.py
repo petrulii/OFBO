@@ -11,7 +11,7 @@ from functools import partial
 from collections import namedtuple
 
 # Import custom VJP implementations
-from utils import root_solve, inner_solution
+from utils import root_solve, inner_solution, GradientBufferManager
 
 # Data structures for tracking state
 AuxP = namedtuple('AuxP', 'params_Q target_params_Q opt_state_Q rng')
@@ -35,10 +35,6 @@ class Agent:
         self.obs_dim = obs_space.shape[0]
         self.action_dim = action_space.n
         self.obs_range = (obs_space.low, obs_space.high)
-        if self.args.average_hypergradients:
-            self.grad_buffer = []
-            self.grad_buffer_size = self.args.grad_buffer_size
-            self.grad_avg_weight = self.args.grad_avg_weight
         
         # Example observations for network initialization
         demo_obs = jnp.ones((1, self.obs_dim))
@@ -67,6 +63,14 @@ class Agent:
             self.dual_Q = self._init_network('dual_Q', (self.obs_dim, self.action_dim, self.args.hidden_dim))
             self.params_dual_Q = self.dual_Q.net.init(next(self.rngs), demo_obs)
             self.opt_state_dual_Q = self.dual_Q.opt.init(self.params_dual_Q)
+
+        # For gradient averaging
+        if self.args.average_hypergradients:
+            # Initialize gradient buffer manager
+            self.grad_buffer_manager = GradientBufferManager(
+                buffer_size=self.args.grad_buffer_size,
+                grad_example=self.params_T
+            )
 
     def _init_network(self, net_type, dims):
         """Initialize a network and its optimizer."""
@@ -545,58 +549,14 @@ class Agent:
             aux_out.target_params_Q, aux_out.opt_state_Q, aux_out.next_obs_nll
         )
     
-    #@partial(jax.jit, static_argnums=(0,6))
+    @partial(jax.jit, static_argnums=(0, 6))
     def update_step_outer_averaged(self, params_T, aux_params, opt_state_T, batch, replay, loss):
-        """Outer update step for world model with gradient averaging."""
+        """JIT-compatible outer update step with arithmetic gradient averaging."""
         # Compute gradients normally
         (value, aux_out), grads = value_and_grad(loss, has_aux=True)(
             params_T, aux_params, batch, replay)
-        
-        # Store current gradient in buffer (using host callback to avoid JIT issues)
-        def store_grad(grads):
-            # Convert to numpy to store
-            grad_np = jax.tree_map(lambda x: jnp.array(x), grads)
-            # Remove oldest if buffer is full
-            if len(self.grad_buffer) >= self.grad_buffer_size:
-                self.grad_buffer.pop(0)
-            # Add current gradient
-            self.grad_buffer.append(grad_np)
-            return 0  # Return value not used
-        
-        # Use host callback to modify the buffer (breaks JIT but unavoidable)
-        store_grad(grads)
-        
-        # Compute weighted average gradient
-        if len(self.grad_buffer) > 1:
-            past_weight = self.grad_avg_weight / len(self.grad_buffer)
-            current_weight = 1.0 - self.grad_avg_weight
-            
-            # Start with weighted current gradient
-            avg_grads = jax.tree_map(lambda x: current_weight * x, grads)
-            
-            # Add weighted past gradients
-            for past_grad in self.grad_buffer:
-                past_grad_jax = jax.tree_map(lambda x: jnp.array(x), past_grad)
-                avg_grads = jax.tree_map(
-                    lambda avg, past: avg + past_weight * past, 
-                    avg_grads, past_grad_jax
-                )
-        else:
-            avg_grads = grads
-        
-        # Apply averaged gradients
-        updates, opt_state_T = self.T.opt.update(avg_grads, opt_state_T)
-        new_params = optax.apply_updates(params_T, updates)
-        
-        # Define output structure
-        UpdOut = namedtuple('Upd_outer', 
-            'loss_T params_T opt_state_T loss_Q vals_Q grad_norm_Q entropy_Q params_Q target_params_Q opt_state_Q next_obs_nll')
-            
-        return UpdOut(
-            value, new_params, opt_state_T, aux_out.loss_Q, 
-            aux_out.vals_Q, aux_out.grad_norm_Q, aux_out.entropy_Q, aux_out.params_Q, 
-            aux_out.target_params_Q, aux_out.opt_state_Q, aux_out.next_obs_nll
-        )
+        return value, aux_out, grads
+
 
     @partial(jax.jit, static_argnums=(0,6))
     def update_step(self, params, aux_params, opt_state, batch, replay, loss_type):
@@ -698,7 +658,25 @@ class Agent:
             # Update world model
             if self.args.average_hypergradients:
                 # Update with outer loop optimization and gradient averaging
-                updout_T = self.update_step_outer_averaged(self.params_T, aux_params, self.opt_state_T, batch, replay, outer_loss)
+                value, aux_out, grads = self.update_step_outer_averaged(self.params_T, aux_params, self.opt_state_T, batch, replay, outer_loss)
+                # Update the gradient buffer and average gradient using the manager
+                grad_buffer, buffer_count, avg_grad = self.grad_buffer_manager.update(grads)
+                # Compute final gradient = beta * grads + (1 - beta) * avg_grad
+                final_grad = jax.tree_map(
+                    lambda g, avg: self.args.beta * g + (1 - self.args.beta) * avg,
+                    grads, 
+                    avg_grad
+                )
+                # Apply averaged gradients
+                #updates, opt_state_T = self.T.opt.update(avg_grad, self.opt_state_T)
+                updates, opt_state_T = self.T.opt.update(final_grad, self.opt_state_T)
+                new_params = optax.apply_updates(self.params_T, updates)
+                UpdOut = namedtuple('Upd_outer', 'loss_T params_T opt_state_T loss_Q vals_Q grad_norm_Q entropy_Q params_Q target_params_Q opt_state_Q next_obs_nll')
+                updout_T = UpdOut(
+                                value, new_params, opt_state_T, aux_out.loss_Q, aux_out.vals_Q,
+                                aux_out.grad_norm_Q, aux_out.entropy_Q, aux_out.params_Q,
+                                aux_out.target_params_Q, aux_out.opt_state_Q, aux_out.next_obs_nll
+                                )
             else:
                 # Update with outer loop optimization
                 updout_T = self.update_step_outer(self.params_T, aux_params, self.opt_state_T, batch, replay, outer_loss)
@@ -708,8 +686,13 @@ class Agent:
             self.target_params_Q = updout_T.target_params_Q
             self.params_T, self.opt_state_T = updout_T.params_T, updout_T.opt_state_T
 
-            # For logging
-            #updout_Q = updout_T
+            # Return dictionary for 'omd' and 'funcBO'
+            return {
+                'grad_norm_Q': updout_T.grad_norm_Q.item() if hasattr(updout_T, 'grad_norm_Q') else 0.0,
+                'grad_norm_model': 0.0,  # No specific T grad norm
+                'loss_T': updout_T.loss_T.item() if hasattr(updout_T, 'loss_T') else 0.0,
+                'loss_Q': updout_T.loss_Q.item() if hasattr(updout_T, 'loss_Q') else 0.0
+            }
             
         elif self.args.agent_type == 'mle':
             # Maximum likelihood estimation
@@ -742,6 +725,14 @@ class Agent:
                 self.params_Q, self.opt_state_Q = updout_Q.params_Q, updout_Q.opt_state_Q
                 self.target_params_Q = self._soft_update_params(self.params_Q, self.target_params_Q)
             
+            # Return dictionary for 'mle'
+            return {
+                'grad_norm_Q': updout_Q.grad_norm_Q.item() if hasattr(updout_Q, 'grad_norm_Q') else 0.0,
+                'grad_norm_model': 0.0,  # T gradient norm isn't tracked for these types
+                'loss_T': updout_T.loss_T.item() if hasattr(updout_T, 'loss_T') else 0.0,
+                'loss_Q': updout_Q.loss_Q.item() if hasattr(updout_Q, 'loss_Q') else 0.0
+            }
+            
         elif self.args.agent_type == 'vep':
             # Value-equivalent prediction
             # Update world model
@@ -772,12 +763,10 @@ class Agent:
                 )
                 self.params_Q, self.opt_state_Q = updout_Q.params_Q, updout_Q.opt_state_Q
                 self.target_params_Q = self._soft_update_params(self.params_Q, self.target_params_Q)
-
-        # Return metrics
-        #return {
-        #    'loss_T': updout_T.loss_T.item(), 
-        #    'vals_Q': updout_Q.vals_Q.item(), 
-        #    'loss_Q': updout_Q.loss_Q.item(), 
-        #    'grad_norm_Q': updout_Q.grad_norm_Q.item(), 
-        #    'entropy_Q': updout_Q.entropy_Q.item()
-        #}
+        
+        return {
+        'grad_norm_Q': 0.0,
+        'grad_norm_model': 0.0,
+        'loss_T': 0.0,
+        'loss_Q': 0.0
+        }
