@@ -1,3 +1,4 @@
+# main.py
 import mlxp
 import os
 import argparse
@@ -39,22 +40,22 @@ def create_default_config():
         'input_dim': 5,
         'hidden_dim': 64,
         'output_dim': 3,
-        'n_samples': 128,
+        'n_samples': 256,
         
         # Time series parameters
         'T_max': 100000,
         'shift_type': 'linear',  # 'linear' or 'sinusoidal'
-        'alpha': 0,#1e-5,  # linear shift rate
+        'alpha': 0,  # linear shift rate
 
         # Noise parameters
-        'noise_level': 1,  # base noise level
+        'noise_level': 0,  # base noise level
         
         # Bilevel optimization parameters
         'agent_type': 'funcBO',  # 'funcBO', 'omd', 'mle'
-        'lambda_reg': 0.1,  # regularization parameter
+        'lambda_reg': 0.01,  # regularization parameter
         'outer_lr': 1e-4,
-        'inner_lr': 1e-4,
-        'num_inner_steps': 10,
+        'inner_lr': 1e-5,
+        'num_inner_steps': 200,
         'num_outer_steps': 1,
         
         # Gradient averaging parameters
@@ -71,6 +72,7 @@ def create_default_config():
         # Network parameters
         'warm_start': True,
         'tau': 0.005,  # soft update parameter
+        'fd_eps': 1e-4  # finite difference epsilon (for funcBO)
     }
     return config
 

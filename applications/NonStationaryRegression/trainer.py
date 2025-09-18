@@ -1,3 +1,4 @@
+# trainer.py
 import os
 import numpy as np
 import time
@@ -83,26 +84,83 @@ class BilevelRegressionAgent:
         mlp = hk.Sequential(layers)
         return mlp(x)
     
+    #@partial(jax.jit, static_argnums=(0,))
+    #def inner_loss(self, lambda_reg, inner_params, X, Y):
+    #    """Inner objective: MSE + output-norm regularization (per-output coordinate)."""
+    #    predictions = self.inner_net.apply(inner_params, X)
+    #    data_loss = jnp.mean((Y - predictions) ** 2)
+    #    reg_loss = jnp.mean(jnp.sum(lambda_reg * (predictions ** 2), axis=-1))
+    #    return data_loss + reg_loss
+
     @partial(jax.jit, static_argnums=(0,))
     def inner_loss(self, lambda_reg, inner_params, X, Y):
-        """Inner objective: MSE + output-norm regularization (per-output coordinate)."""
-        predictions = self.inner_net.apply(inner_params, X)
-        data_loss = jnp.mean((Y - predictions) ** 2)
-        reg_loss = jnp.mean(jnp.sum(lambda_reg * (predictions ** 2), axis=-1))
+        """
+        Inner objective: MSE + per-output Tikhonov penalty on ||∇_x h||^2,
+        implemented with forward finite differences using only evaluations of h.
+        """
+        preds = self.inner_net.apply(inner_params, X)  # h on augmented inputs
+        N = Y.shape[0]                                 # size of the base minibatch
+
+        # Base predictions (on the original X)
+        H0 = preds[:N]                                 # shape (N, d_out)
+
+        # If no augmentation was passed, fall back to the old value penalty
+        if preds.shape[0] == N:
+            data_loss = jnp.mean((Y - H0)**2)
+            reg_loss  = jnp.mean(jnp.sum(lambda_reg * (H0**2), axis=-1))
+            return data_loss + reg_loss
+
+        # Otherwise, use FD penalty. Layout: blocks of size N for each input dim
+        d = self.config.input_dim
+        d_out = H0.shape[1]
+        H_fd = preds[N:].reshape(d, N, d_out)          # shape (d, N, d_out)
+
+        # Forward FD approximation of ∂h/∂x_k at each sample
+        diff = (H_fd - H0[None, :, :]) / self.config.fd_eps   # (d, N, d_out)
+
+        # Per-output Jacobian-squared: sum over input dims, keep output coords
+        grad_sq = jnp.sum(diff**2, axis=0)             # (N, d_out)
+
+        data_loss = jnp.mean((Y - H0)**2)
+        reg_loss  = jnp.mean(jnp.sum(lambda_reg * grad_sq, axis=-1))
+        jax.debug.print("Inner loss: data {d:.4f}, reg {r:.4f}, norm of lambda {l:.4f}", d=data_loss, r=reg_loss, l=jnp.linalg.norm(lambda_reg))
         return data_loss + reg_loss
+
+    #@partial(jax.jit, static_argnums=(0,))
+    #def grad_inner_loss(self, lambda_reg, val_h, replay, rng_unused, _unused):
+    #    """
+    #    Functional inner gradient: ∂/∂v [ mean(||Y_in - v||^2) + mean(⟨lambda_reg, v^2⟩) ].
+    #    Here 'val_h' must be h(X_inner).
+    #    We stash Y_inner at replay[2] to reuse RL's inner_solution interface.
+    #    """
+    #    Y_in = replay[2]  # we will pack Y_inner here
+    #    def loss_wrt_values(v):
+    #        data = jnp.mean((Y_in - v)**2)
+    #        reg  = jnp.mean(jnp.sum(lambda_reg * (v**2), axis=-1))
+    #        return data + reg
+    #    return jax.grad(loss_wrt_values)(val_h)
 
     @partial(jax.jit, static_argnums=(0,))
     def grad_inner_loss(self, lambda_reg, val_h, replay, rng_unused, _unused):
         """
-        Functional inner gradient: ∂/∂v [ mean(||Y_in - v||^2) + mean(⟨lambda_reg, v^2⟩) ].
-        Here 'val_h' must be h(X_inner).
-        We stash Y_inner at replay[2] to reuse RL's inner_solution interface.
+        Functional inner gradient for the FD-Jacobian penalty. 'val_h' contains
+        h evaluated on the augmented inputs [X, X+eps*e1, ..., X+eps*ed].
+        We stash Y_inner at replay[2].
         """
-        Y_in = replay[2]  # we will pack Y_inner here
-        def loss_wrt_values(v):
-            data = jnp.mean((Y_in - v)**2)
-            reg  = jnp.mean(jnp.sum(lambda_reg * (v**2), axis=-1))
+        Y_in = replay[2]
+        N = Y_in.shape[0]
+        d_out = val_h.shape[1]
+        d = self.config.input_dim
+
+        def loss_wrt_values(v_aug):
+            H0  = v_aug[:N]                            # (N, d_out)
+            Hfd = v_aug[N:].reshape(d, N, d_out)       # (d, N, d_out)
+            diff = (Hfd - H0[None, :, :]) / self.config.fd_eps
+            grad_sq = jnp.sum(diff**2, axis=0)         # (N, d_out)
+            data = jnp.mean((Y_in - H0)**2)
+            reg  = jnp.mean(jnp.sum(lambda_reg * grad_sq, axis=-1))
             return data + reg
+
         return jax.grad(loss_wrt_values)(val_h)
     
     @partial(jax.jit, static_argnums=(0,))
@@ -176,6 +234,22 @@ class BilevelRegressionAgent:
         # obs = X_inner (for val_Q), next_obs = X_outer (for val_target_Q), reward = Y_inner
         replay = (X_inner, dummy_a, Y_inner, X_outer, dummy_nd, dummy_nd)
 
+
+        # BEFORE
+        # replay = (X_inner, dummy_a, Y_inner, X_outer, dummy_nd, dummy_nd)
+
+        # AFTER (augment inner inputs with forward-difference probes)
+        eps = self.config.fd_eps
+        d = self.config.input_dim
+        eye = jnp.eye(d, dtype=X_inner.dtype)
+
+        # stack [X, X + eps*e1, ..., X + eps*ed]
+        X_fd_blocks = [X_inner + eps * eye[k][None, :] for k in range(d)]
+        X_inner_aug = jnp.concatenate([X_inner] + X_fd_blocks, axis=0)
+
+        replay = (X_inner_aug, dummy_a, Y_inner, X_outer, dummy_nd, dummy_nd)
+
+
         # Package the "data blob" that inner_solution will pass around
         #data = {
         #    "X_inner": X_inner, "Y_inner": Y_inner,   # inner split for fitting h_λ
@@ -194,19 +268,104 @@ class BilevelRegressionAgent:
             return Sol(sol.params, sol.loss, None, sol.grad_norm, None, target, sol.opt_state, None)
 
         # Backward solver
-        def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer):
-            X_out = rpl[3]  # X_outer
-            # Simple MSE training of the dual to match the adjoint signal
-            preds = self.dual_net.apply(params_dual, X_out)
-            loss  = jnp.mean((preds - outer_grad_on_outer)**2)
-            grads = jax.grad(lambda p: jnp.mean((self.dual_net.apply(p, X_out)
-                                                - outer_grad_on_outer)**2))(params_dual)
+        def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer, lambda_for_adj):
+            X_in_aug, X_out = rpl[0], rpl[3]
+
+            # Adjoint evaluations on augmented inner inputs and outer inputs
+            a_in  = self.dual_net.apply(params_dual, X_in_aug)  # shape: ((d+1)N, d_out)
+            a_out = self.dual_net.apply(params_dual, X_out)
+
+            # Split augmented adjoints into base and FD probes
+            N      = rpl[2].shape[0]                      # |B_in|
+            d_out  = a_in.shape[1]
+            eps    = self.config.fd_eps
+            lam    = jax.lax.stop_gradient(lambda_for_adj)    # (d_out,)
+
+            a0     = a_in[:N, :]                           # (N, d_out) adjoint at base x
+            a_fd   = a_in[N:, :].reshape(self.config.input_dim, N, d_out)  # (d, N, d_out)
+
+            # 0.5 * a^T (∂_v^2 Win) a  =  ||a0||^2  +  sum_c lam_c * sum_k ((a0 - a_fd_k)^2)/eps^2
+            data_quad = jnp.sum(a0**2, axis=-1)  # (N,)
+            diff      = (a_fd - a0[None, :, :]) / eps                 # (d, N, d_out)
+            fd_quad   = jnp.sum(jnp.sum(lam[None, None, :] * (diff**2), axis=0), axis=-1)  # (N,)
+
+            hess_term = jnp.mean(data_quad + fd_quad)
+
+            # Linear outer term: a_out^T ∂_v Wout on B_out
+            lin_term  = jnp.mean(jnp.sum(a_out * outer_grad_on_outer, axis=-1))
+
+            loss = hess_term + lin_term
+
+            # SGD step on dual params (unchanged)
+            def loss_wrt_params(p):
+                a_in_p  = self.dual_net.apply(p, X_in_aug)
+                a_out_p = self.dual_net.apply(p, X_out)
+                a0_p    = a_in_p[:N, :]
+                a_fd_p  = a_in_p[N:, :].reshape(self.config.input_dim, N, d_out)
+                data_q  = jnp.sum(a0_p**2, axis=-1)
+                diff_p  = (a_fd_p - a0_p[None, :, :]) / eps
+                fd_q    = jnp.sum(jnp.sum(lam[None, None, :] * (diff_p**2), axis=0), axis=-1)
+                return jnp.mean(data_q + fd_q) + jnp.mean(jnp.sum(a_out_p * outer_grad_on_outer, axis=-1))
+
+            grads = jax.grad(loss_wrt_params)(params_dual)
             updates, new_opt = self.dual_opt.update(grads, aux_params.opt_state_dual)
             new_params = optax.apply_updates(params_dual, updates)
+
+            DualSol = namedtuple('DualSol','params_dual_Q val_dual_Q loss_dual_Q opt_state_dual_Q grad_norm_dual_Q')
+            gn = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
+            # Return adjoint on INNER inputs (augmented) for the VJP over Win
+            a_in_new = self.dual_net.apply(new_params, X_in_aug)
+            return DualSol(new_params, a_in_new, loss, new_opt, gn)
+
+        """def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer, lambda_for_adj):
+            X_in,  X_out = rpl[0], rpl[3]  # inner / outer inputs
+
+            # Predict adjoint on both domains
+            a_in  = self.dual_net.apply(params_dual, X_in)
+            a_out = self.dual_net.apply(params_dual, X_out)
+
+            # For Lin(v) = mean(||Y_in - v||^2) + mean(<λ, v^2>):
+            # ∂^2_v Lin = 2(I + diag(λ))  ⇒  0.5 * a^T ∂^2_v Lin a = (1+λ)·a^2
+            #H_diag = (1.0 + lambda_reg)  # shape (output_dim,)
+            # Use the current λ passed from utils.argmin_bwd, but do not create a grad path here
+            H_diag = 1.0 + jax.lax.stop_gradient(lambda_for_adj)  # shape (output_dim,)
+
+            # Empirical adjoint objective
+            hess_term = jnp.mean(jnp.sum(H_diag * (a_in ** 2), axis=-1))            # inner batch
+            lin_term  = jnp.mean(jnp.sum(a_out * outer_grad_on_outer, axis=-1))     # outer batch
+            loss = hess_term + lin_term
+
+            def loss_wrt_params(p):
+                a_in_p  = self.dual_net.apply(p, X_in)
+                a_out_p = self.dual_net.apply(p, X_out)
+                return (jnp.mean(jnp.sum(H_diag * (a_in_p ** 2), axis=-1)) +
+                        jnp.mean(jnp.sum(a_out_p * outer_grad_on_outer, axis=-1)))
+
+            grads = jax.grad(loss_wrt_params)(params_dual)
+            updates, new_opt = self.dual_opt.update(grads, aux_params.opt_state_dual)
+            new_params = optax.apply_updates(params_dual, updates)
+
             DualSol = namedtuple('DualSol',
                                 'params_dual_Q val_dual_Q loss_dual_Q opt_state_dual_Q grad_norm_dual_Q')
             gn = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
-            return DualSol(new_params, self.dual_net.apply(new_params, X_out), loss, new_opt, gn)
+
+            # IMPORTANT: return a(x) on INNER inputs for the VJP over Lin
+            a_in_new = self.dual_net.apply(new_params, X_in)
+            return DualSol(new_params, a_in_new, loss, new_opt, gn)"""
+            
+        #def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer):
+        #    X_out = rpl[3]  # X_outer
+        #    # Simple MSE training of the dual to match the adjoint signal
+        #    preds = self.dual_net.apply(params_dual, X_out)
+        #    loss  = jnp.mean((preds - outer_grad_on_outer)**2)
+        #    grads = jax.grad(lambda p: jnp.mean((self.dual_net.apply(p, X_out)
+        #                                        - outer_grad_on_outer)**2))(params_dual)
+        #    updates, new_opt = self.dual_opt.update(grads, aux_params.opt_state_dual)
+        #    new_params = optax.apply_updates(params_dual, updates)
+        #    DualSol = namedtuple('DualSol',
+        #                        'params_dual_Q val_dual_Q loss_dual_Q opt_state_dual_Q grad_norm_dual_Q')
+        #    gn = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
+        #    return DualSol(new_params, self.dual_net.apply(new_params, X_out), loss, new_opt, gn)
 
         # Call the custom-VJP driver
         sol = inner_solution(
@@ -264,7 +423,7 @@ class BilevelRegressionAgent:
         (value, aux_out), grads = value_and_grad(loss_fn, has_aux=True)(lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer)
         updates, opt_state_outer = self.outer_opt.update(grads, opt_state_outer)
         new_lambda = optax.apply_updates(lambda_reg_array, updates)
-        new_lambda = jnp.maximum(new_lambda, 1e-6)
+        new_lambda = jnp.maximum(new_lambda, 0.)
         return value, new_lambda, opt_state_outer, aux_out
     
     def update(self, X_inner, Y_inner, X_outer=None, Y_outer=None):
@@ -308,7 +467,7 @@ class BilevelRegressionAgent:
 
             updates, self.opt_state_outer = self.outer_opt.update(final_grad, self.opt_state_outer)
             new_lambda_array = optax.apply_updates(lambda_reg_array, updates)
-            new_lambda_array = jnp.maximum(new_lambda_array, 1e-6)
+            new_lambda_array = jnp.maximum(new_lambda_array, 0.)#1e-6)
         else:
             value, new_lambda_array, self.opt_state_outer, aux_out = self.update_step_outer(
                 lambda_reg_array, aux_params, self.opt_state_outer,
@@ -336,7 +495,9 @@ class BilevelRegressionAgent:
             'outer_loss': float(value),
             'inner_loss': float(aux_out.loss_Q),
             'grad_norm': float(aux_out.grad_norm_Q),
-            'lambda_reg_0': float(self.lambda_reg[0])  # log only first coordinate
+            'lambda_reg_0': float(self.lambda_reg[0]),  # log only first coordinate
+            'lambda_reg_1': float(self.lambda_reg[1]),
+            'lambda_reg_2': float(self.lambda_reg[2]),
         }
 
 
@@ -364,6 +525,20 @@ class BilevelRegressionTrainer:
         # Generate fixed input data
         self.X = self._generate_input_data()
         
+        # Disjoint inner/outer split
+        n = self.X.shape[0]
+        perm = np.random.permutation(n)
+
+        outer_frac = getattr(self.config, "split_outer", 0.5)  # default 20% outer
+        n_out = max(1, int(outer_frac * n))
+
+        self.outer_idx = perm[:n_out]
+        self.inner_idx = perm[n_out:]
+
+        # Cache the split inputs to avoid accidental mixing later
+        self.X_in  = self.X[self.inner_idx]
+        self.X_out = self.X[self.outer_idx]
+
         # Initialize true function
         self.true_net = hk.without_apply_rng(hk.transform(
             partial(self._true_network_fn, config.hidden_dim, config.output_dim)
@@ -609,10 +784,45 @@ class BilevelRegressionTrainer:
         for t in range(1, self.config.T_max + 1):
             key_inner = next(step_key_seq)
             key_outer = next(step_key_seq)
-            # Generate inner and outer targets for current time step
-            Y_inner = self.get_target_at_time(t, key_inner)
-            Y_outer = self.get_target_at_time(t, key_outer)  # truly independent
-            metrics = self.agent.update(self.X, Y_inner, X_outer=self.X, Y_outer=Y_outer)
+
+            # Build independent targets, then SLICE them on the fixed split
+            Y_inner_full = self.get_target_at_time(t, key_inner)
+            Y_outer_full = self.get_target_at_time(t, key_outer)
+
+            Y_inner_pool = Y_inner_full[self.inner_idx]   # shape: (N_in, d_out)
+            Y_outer_pool = Y_outer_full[self.outer_idx]   # shape: (N_out, d_out)
+
+            N_in  = self.X_in.shape[0]
+            N_out = self.X_out.shape[0]
+
+            # Decide one common minibatch size B
+            B_cfg = getattr(self.config, "batch_size", None)
+            if B_cfg is None:
+                # fall back to the smallest pool size if not specified
+                B = min(N_in, N_out)
+            else:
+                B = min(B_cfg, N_in, N_out)
+
+            # Sample *independently* from each pool (keeps inner/outer disjoint by construction)
+            idx_in  = jax.random.choice(key_inner, N_in,  (B,), replace=False)
+            idx_out = jax.random.choice(key_outer, N_out, (B,), replace=False)
+
+            X_inner = self.X_in[idx_in]
+            Y_inner = Y_inner_pool[idx_in]
+
+            X_outer = self.X_out[idx_out]
+            Y_outer = Y_outer_pool[idx_out]
+
+            # Sanity: equal batch sizes, still disjoint pools
+            assert X_inner.shape[0] == X_outer.shape[0] == Y_inner.shape[0] == Y_outer.shape[0] == B
+
+            # Pass minibatches to the agent
+            metrics = self.agent.update(X_inner, Y_inner, X_outer=X_outer, Y_outer=Y_outer)
+
+            #Y_inner = Y_inner_full[self.inner_idx]
+            #Y_outer = Y_outer_full[self.outer_idx]
+            # Pass disjoint X/Y to the agent
+            #metrics = self.agent.update(self.X_in, Y_inner, X_outer=self.X_out, Y_outer=Y_outer)
             
             # Add time step to metrics
             metrics['time_step'] = t

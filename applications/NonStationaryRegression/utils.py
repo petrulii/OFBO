@@ -1,3 +1,4 @@
+# utils.py
 import jax
 import jax.numpy as jnp
 from jax import tree_map
@@ -240,11 +241,13 @@ def argmin_fwd(inner_loss, inner_model, init_xs, params, replay, rng, params_dua
 def argmin_bwd(inner_loss, inner_model, solvers, res, g):
     """Backward pass for inner_solution using backward solver."""
     pQ, init_xs, params, replay, rng, tpQ, params_dual_Q = res
-    g_main = g[0] if isinstance(g, tuple) else g
+    #g_main = g[0] if isinstance(g, tuple) else g
+    g_main = g[1] if isinstance(g, tuple) else g  # use ∂ outer loss / ∂ val_target_Q (outer)
     
     # Use backward solver to approximate gradients
     bwd_solver = solvers[1]
-    sol = bwd_solver(params_dual_Q, replay, rng, g_main)
+    #sol = bwd_solver(params_dual_Q, replay, rng, g_main)
+    sol = bwd_solver(params_dual_Q, replay, rng, g_main, params) # pass the current outer params (λ) explicitly to the adjoint solver
 
     # Compute vector-Jacobian product
     _, vdp_fun = jax.vjp(lambda y: inner_loss(y, pQ, replay, rng, tpQ), params)
