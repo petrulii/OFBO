@@ -1,5 +1,6 @@
 # trainer.py
 import os
+import sys
 import numpy as np
 import time
 import jax
@@ -21,9 +22,10 @@ from utils import inner_solution, root_solve, GradientBufferManager
 try:
     import wandb
     WANDB_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     WANDB_AVAILABLE = False
-    print("wandb not available, logging will be disabled")
+    print(e, file=sys.stderr)
+    print("wandb not available, logging will be disabled", file=sys.stderr)
 
 # Data structures for tracking state
 AuxParams = namedtuple('AuxParams', 'inner_params target_inner_params dual_params opt_state_inner opt_state_dual rng lambda_reg')
@@ -61,24 +63,24 @@ class BilevelRegressionAgent:
             self.opt_state_dual = self.dual_opt.init(self.dual_params)
         
         # Outer parameter (regularization vector)
-        init_val = float(config.lambda_reg)  # e.g. 0.1 from config
-        self.lambda_reg = jnp.full((config.output_dim,), init_val, dtype=jnp.float32)
+        init_val = float(config.lambda_reg)
+        self.lambda_reg = jnp.full((config.window_size,), init_val, dtype=jnp.float32)
         self.opt_state_outer = self.outer_opt.init(self.lambda_reg)
-        
+
         # For gradient averaging
         if config.average_hypergradients:
             self.grad_buffer_manager = GradientBufferManager(
                 buffer_size = config.grad_buffer_size,
-                grad_example = jnp.full((config.output_dim,), init_val, dtype=jnp.float32)
+                grad_example = jnp.full((config.window_size,), init_val, dtype=jnp.float32)
             )
     
     def _network_fn(self, hidden_dim, output_dim, x):
         """Define network architecture."""
         layers = [
             hk.Linear(hidden_dim, w_init=hk.initializers.Orthogonal()),
-            jax.nn.relu,
+            jax.nn.gelu,
             hk.Linear(hidden_dim, w_init=hk.initializers.Orthogonal()),
-            jax.nn.relu,
+            jax.nn.gelu,
             hk.Linear(output_dim, w_init=hk.initializers.Orthogonal(scale=1e-1))
         ]
         mlp = hk.Sequential(layers)
@@ -93,38 +95,35 @@ class BilevelRegressionAgent:
     #    return data_loss + reg_loss
 
     @partial(jax.jit, static_argnums=(0,))
-    def inner_loss(self, lambda_reg, inner_params, X, Y):
+    def inner_loss_window_weighted(self, params_lambda, params_h, X_in, Y_in, deltas, block_idx):
         """
-        Inner objective: MSE + per-output Tikhonov penalty on ||∇_x h||^2,
-        implemented with forward finite differences using only evaluations of h.
+        sum_s λ_s * (1/B) * Σ_i ||Y_{s,i} - h(X_i)||^2 on stacked window blocks,
+        implemented without dynamic reshapes/ints (JAX-safe).
         """
-        preds = self.inner_net.apply(inner_params, X)  # h on augmented inputs
-        N = Y.shape[0]                                 # size of the base minibatch
+        preds    = self.inner_net.apply(params_h, X_in)             # (N_tot, d_out)
+        per_samp = jnp.sum((Y_in - preds) ** 2, axis=-1)            # (N_tot,)
+        segs     = block_idx.reshape(-1).astype(jnp.int32)          # (N_tot,)
+        deltas_1 = deltas.reshape(-1)                               # (N_tot,)
 
-        # Base predictions (on the original X)
-        H0 = preds[:N]                                 # shape (N, d_out)
+        num_segments = int(self.config.window_size)  # static Python int
 
-        # If no augmentation was passed, fall back to the old value penalty
-        if preds.shape[0] == N:
-            data_loss = jnp.mean((Y - H0)**2)
-            reg_loss  = jnp.mean(jnp.sum(lambda_reg * (H0**2), axis=-1))
-            return data_loss + reg_loss
+        # Sum and counts per block id in [0, num_segments)
+        sum_per_block   = jnp.zeros((num_segments,), per_samp.dtype).at[segs].add(per_samp)
+        count_per_block = jnp.zeros((num_segments,), per_samp.dtype).at[segs].add(1.0)
+        mean_loss_block = sum_per_block / jnp.maximum(count_per_block, 1.0)  # (num_segments,)
 
-        # Otherwise, use FD penalty. Layout: blocks of size N for each input dim
-        d = self.config.input_dim
-        d_out = H0.shape[1]
-        H_fd = preds[N:].reshape(d, N, d_out)          # shape (d, N, d_out)
+        # Per-block Δ (all samples in a block share the same Δ, so mean == that Δ)
+        sum_delta_block = jnp.zeros((num_segments,), deltas_1.dtype).at[segs].add(deltas_1)
+        delta_block     = sum_delta_block / jnp.maximum(count_per_block, 1.0)  # (num_segments,)
 
-        # Forward FD approximation of ∂h/∂x_k at each sample
-        diff = (H_fd - H0[None, :, :]) / self.config.fd_eps   # (d, N, d_out)
+        # Map Δ -> window slot index in [0, window_size-1]
+        slot_idx = jnp.clip(delta_block.astype(jnp.int32) - 1, 0, self.config.window_size - 1)
 
-        # Per-output Jacobian-squared: sum over input dims, keep output coords
-        grad_sq = jnp.sum(diff**2, axis=0)             # (N, d_out)
+        # Pick λ for each (existing) block; segments with count 0 contribute 0 anyway
+        lam_vec = params_lambda[slot_idx]  # (num_segments,)
 
-        data_loss = jnp.mean((Y - H0)**2)
-        reg_loss  = jnp.mean(jnp.sum(lambda_reg * grad_sq, axis=-1))
-        jax.debug.print("Inner loss: data {d:.4f}, reg {r:.4f}, norm of lambda {l:.4f}", d=data_loss, r=reg_loss, l=jnp.linalg.norm(lambda_reg))
-        return data_loss + reg_loss
+        # Exact objective: sum_s λ_s * (1/B) Σ_i loss_{s,i}
+        return jnp.sum(lam_vec * mean_loss_block)
 
     #@partial(jax.jit, static_argnums=(0,))
     #def grad_inner_loss(self, lambda_reg, val_h, replay, rng_unused, _unused):
@@ -139,29 +138,31 @@ class BilevelRegressionAgent:
     #        reg  = jnp.mean(jnp.sum(lambda_reg * (v**2), axis=-1))
     #        return data + reg
     #    return jax.grad(loss_wrt_values)(val_h)
-
+    
     @partial(jax.jit, static_argnums=(0,))
     def grad_inner_loss(self, lambda_reg, val_h, replay, rng_unused, _unused):
         """
-        Functional inner gradient for the FD-Jacobian penalty. 'val_h' contains
-        h evaluated on the augmented inputs [X, X+eps*e1, ..., X+eps*ed].
-        We stash Y_inner at replay[2].
+        For sample i in block s: grad_i = (2/B_s) * λ_{slot(s)} * (h_i - y_i),
+        where B_s is the size of block s. We compute 1/B_s via per-block counts.
         """
-        Y_in = replay[2]
-        N = Y_in.shape[0]
-        d_out = val_h.shape[1]
-        d = self.config.input_dim
+        Y_in      = replay[2]                                  # (N_tot, d_out)
+        deltas    = replay[1].reshape(-1)                      # (N_tot,)
+        block_idx = replay[5].reshape(-1).astype(jnp.int32)    # (N_tot,)
 
-        def loss_wrt_values(v_aug):
-            H0  = v_aug[:N]                            # (N, d_out)
-            Hfd = v_aug[N:].reshape(d, N, d_out)       # (d, N, d_out)
-            diff = (Hfd - H0[None, :, :]) / self.config.fd_eps
-            grad_sq = jnp.sum(diff**2, axis=0)         # (N, d_out)
-            data = jnp.mean((Y_in - H0)**2)
-            reg  = jnp.mean(jnp.sum(lambda_reg * grad_sq, axis=-1))
-            return data + reg
+        residual = (val_h - Y_in)                              # (N_tot, d_out)
 
-        return jax.grad(loss_wrt_values)(val_h)
+        num_segments = int(self.config.window_size)
+        # counts per block
+        ones  = jnp.ones(block_idx.shape[0], dtype=val_h.dtype)
+        counts = jnp.zeros((num_segments,), val_h.dtype).at[block_idx].add(1.0)  # (num_segments,)
+        inv_B_per_sample = 1.0 / jnp.maximum(counts[block_idx], 1.0)             # (N_tot,)
+
+        # λ per sample via Δ -> slot mapping
+        slot_ids = jnp.clip(deltas.astype(jnp.int32) - 1, 0, self.config.window_size - 1)  # (N_tot,)
+        lam_per_sample = lambda_reg[slot_ids]                                              # (N_tot,)
+
+        grad_vals = 2.0 * inv_B_per_sample[:, None] * lam_per_sample[:, None] * residual   # (N_tot, d_out)
+        return grad_vals
     
     @partial(jax.jit, static_argnums=(0,))
     def outer_loss_simple(self, inner_params, X, Y):
@@ -204,7 +205,7 @@ class BilevelRegressionAgent:
         dual_predictions = self.dual_net.apply(params, X)
         return dual_predictions, opt_state
     
-    def loss_funcBO(self, lambda_reg, aux_params, X_inner, Y_inner, X_outer, Y_outer):
+    def loss_funcBO(self, lambda_reg, aux_params, X_inner, Y_inner, X_outer, Y_outer, deltas_inner=None, block_index=None):
         """
         Assumptions this follows:
         - `inner_solution` orchestrates the bilevel step via a custom VJP and expects:
@@ -229,83 +230,79 @@ class BilevelRegressionAgent:
     
         # Pseudo-replay shaped like RL
         n = X_inner.shape[0]
-        dummy_a  = jnp.zeros((n, 1), dtype=jnp.int32)
         dummy_nd = jnp.ones((n, 1), dtype=jnp.float32)
-        # obs = X_inner (for val_Q), next_obs = X_outer (for val_target_Q), reward = Y_inner
-        replay = (X_inner, dummy_a, Y_inner, X_outer, dummy_nd, dummy_nd)
 
+        # defaults
+        if deltas_inner is None:
+            deltas_inner = jnp.ones((n, 1), dtype=jnp.float32)
+        if block_index is None:
+            block_index = jnp.zeros((n, 1), dtype=jnp.int32)
 
-        # BEFORE
-        # replay = (X_inner, dummy_a, Y_inner, X_outer, dummy_nd, dummy_nd)
-
-        # AFTER (augment inner inputs with forward-difference probes)
-        eps = self.config.fd_eps
-        d = self.config.input_dim
-        eye = jnp.eye(d, dtype=X_inner.dtype)
-
-        # stack [X, X + eps*e1, ..., X + eps*ed]
-        X_fd_blocks = [X_inner + eps * eye[k][None, :] for k in range(d)]
-        X_inner_aug = jnp.concatenate([X_inner] + X_fd_blocks, axis=0)
-
-        replay = (X_inner_aug, dummy_a, Y_inner, X_outer, dummy_nd, dummy_nd)
-
-
-        # Package the "data blob" that inner_solution will pass around
-        #data = {
-        #    "X_inner": X_inner, "Y_inner": Y_inner,   # inner split for fitting h_λ
-        #    "X_outer": X_outer, "Y_outer": Y_outer,   # outer split for bilevel objective
-        #}
+        # Pack replay as (obs, actions, reward, next_obs, not_dones, not_dones_no_max)
+        # Here: actions := deltas (Δ), and we also need block ids
+        # We'll carry block ids in the "not_dones_no_max" slot (any free slot works consistently)
+        replay = (X_inner, deltas_inner, Y_inner, X_outer, dummy_nd, block_index.astype(jnp.int32))
 
         # Forward solver: update inner params on (X_inner, Y_inner) with λ
         def fwd_solver(params_h, params_lambda, rpl, rng_unused):
-            sol = self.forward_solver(params_lambda, params_h, aux_params.opt_state_inner,
-                                    rpl[0],        # X_inner
-                                    rpl[2])        # Y_inner (we put it in 'reward')
+            X_in, deltas, Y_in = rpl[0], rpl[1].reshape(-1), rpl[2]
+            block_idx = rpl[5].reshape(-1).astype(jnp.int32)
+
+            def inner_loss_weighted(p):
+                return self.inner_loss_window_weighted(params_lambda, p, X_in, Y_in, deltas, block_idx)
+
+            params = aux_params.inner_params
+            opt_state = aux_params.opt_state_inner
+            for _ in range(self.config.num_inner_steps):
+                loss_val, grads = value_and_grad(inner_loss_weighted)(params)
+                updates, opt_state = self.inner_opt.update(grads, opt_state)
+                params = optax.apply_updates(params, updates)
+
+            grad_norm = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
             Sol = namedtuple('Sol', 'params_Q loss_Q vals_Q grad_norm_Q entropy_Q '
                                     'target_params_Q opt_state_Q next_obs_nll')
-            # We don’t need a target net here, pass something
-            target = sol.params
-            return Sol(sol.params, sol.loss, None, sol.grad_norm, None, target, sol.opt_state, None)
+            target = params
+            return Sol(params, loss_val, None, grad_norm, None, target, opt_state, None)
 
         # Backward solver
         def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer, lambda_for_adj):
-            X_in_aug, X_out = rpl[0], rpl[3]
+            X_in, deltas, Y_in, X_out = rpl[0], rpl[1].reshape(-1), rpl[2], rpl[3]
+            block_idx = rpl[5].reshape(-1).astype(jnp.int32)
 
-            # Adjoint evaluations on augmented inner inputs and outer inputs
-            a_in  = self.dual_net.apply(params_dual, X_in_aug)  # shape: ((d+1)N, d_out)
-            a_out = self.dual_net.apply(params_dual, X_out)
+            a_in  = self.dual_net.apply(params_dual, X_in)    # (N_tot, d_out)
+            a_out = self.dual_net.apply(params_dual, X_out)   # (B, d_out)
 
-            # Split augmented adjoints into base and FD probes
-            N      = rpl[2].shape[0]                      # |B_in|
-            d_out  = a_in.shape[1]
-            eps    = self.config.fd_eps
-            lam    = jax.lax.stop_gradient(lambda_for_adj)    # (d_out,)
+            a2        = jnp.sum(a_in ** 2, axis=-1)                  # (N_tot,)
+            segs      = block_idx                                    # (N_tot,)
+            num_segs  = int(self.config.window_size)
 
-            a0     = a_in[:N, :]                           # (N, d_out) adjoint at base x
-            a_fd   = a_in[N:, :].reshape(self.config.input_dim, N, d_out)  # (d, N, d_out)
+            sum_a     = jnp.zeros((num_segs,), a2.dtype).at[segs].add(a2)
+            cnts      = jnp.zeros((num_segs,), a2.dtype).at[segs].add(1.0)
+            per_block_a = sum_a / jnp.maximum(cnts, 1.0)             # (num_segs,)
 
-            # 0.5 * a^T (∂_v^2 Win) a  =  ||a0||^2  +  sum_c lam_c * sum_k ((a0 - a_fd_k)^2)/eps^2
-            data_quad = jnp.sum(a0**2, axis=-1)  # (N,)
-            diff      = (a_fd - a0[None, :, :]) / eps                 # (d, N, d_out)
-            fd_quad   = jnp.sum(jnp.sum(lam[None, None, :] * (diff**2), axis=0), axis=-1)  # (N,)
+            deltas_1    = deltas                                     # (N_tot,)
+            sum_delta   = jnp.zeros((num_segs,), deltas_1.dtype).at[segs].add(deltas_1)
+            delta_block = sum_delta / jnp.maximum(cnts, 1.0)         # (num_segs,)
 
-            hess_term = jnp.mean(data_quad + fd_quad)
+            slot_idx = jnp.clip(delta_block.astype(jnp.int32) - 1, 0, self.config.window_size - 1)
+            lam_vec  = jax.lax.stop_gradient(lambda_for_adj)[slot_idx]  # (num_segs,)
 
-            # Linear outer term: a_out^T ∂_v Wout on B_out
+            # 0.5 a^T H a with H = blockdiag((2/B_s) λ_s I) ⇒ λ_s * mean_i ||a||^2 per block
+            hess_term = jnp.sum(lam_vec * per_block_a)
+
+            # linear outer term unchanged
             lin_term  = jnp.mean(jnp.sum(a_out * outer_grad_on_outer, axis=-1))
-
             loss = hess_term + lin_term
 
-            # SGD step on dual params (unchanged)
             def loss_wrt_params(p):
-                a_in_p  = self.dual_net.apply(p, X_in_aug)
+                a_in_p  = self.dual_net.apply(p, X_in)
                 a_out_p = self.dual_net.apply(p, X_out)
-                a0_p    = a_in_p[:N, :]
-                a_fd_p  = a_in_p[N:, :].reshape(self.config.input_dim, N, d_out)
-                data_q  = jnp.sum(a0_p**2, axis=-1)
-                diff_p  = (a_fd_p - a0_p[None, :, :]) / eps
-                fd_q    = jnp.sum(jnp.sum(lam[None, None, :] * (diff_p**2), axis=0), axis=-1)
-                return jnp.mean(data_q + fd_q) + jnp.mean(jnp.sum(a_out_p * outer_grad_on_outer, axis=-1))
+                a2_p    = jnp.sum(a_in_p ** 2, axis=-1)
+                sum_a_p = jnp.zeros((num_segs,), a2_p.dtype).at[segs].add(a2_p)
+                per_block_a_p = sum_a_p / jnp.maximum(cnts, 1.0)
+                hess_p = jnp.sum(lam_vec * per_block_a_p)
+                lin_p  = jnp.mean(jnp.sum(a_out_p * outer_grad_on_outer, axis=-1))
+                return hess_p + lin_p
 
             grads = jax.grad(loss_wrt_params)(params_dual)
             updates, new_opt = self.dual_opt.update(grads, aux_params.opt_state_dual)
@@ -313,46 +310,9 @@ class BilevelRegressionAgent:
 
             DualSol = namedtuple('DualSol','params_dual_Q val_dual_Q loss_dual_Q opt_state_dual_Q grad_norm_dual_Q')
             gn = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
-            # Return adjoint on INNER inputs (augmented) for the VJP over Win
-            a_in_new = self.dual_net.apply(new_params, X_in_aug)
+            a_in_new = self.dual_net.apply(new_params, X_in)
             return DualSol(new_params, a_in_new, loss, new_opt, gn)
 
-        """def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer, lambda_for_adj):
-            X_in,  X_out = rpl[0], rpl[3]  # inner / outer inputs
-
-            # Predict adjoint on both domains
-            a_in  = self.dual_net.apply(params_dual, X_in)
-            a_out = self.dual_net.apply(params_dual, X_out)
-
-            # For Lin(v) = mean(||Y_in - v||^2) + mean(<λ, v^2>):
-            # ∂^2_v Lin = 2(I + diag(λ))  ⇒  0.5 * a^T ∂^2_v Lin a = (1+λ)·a^2
-            #H_diag = (1.0 + lambda_reg)  # shape (output_dim,)
-            # Use the current λ passed from utils.argmin_bwd, but do not create a grad path here
-            H_diag = 1.0 + jax.lax.stop_gradient(lambda_for_adj)  # shape (output_dim,)
-
-            # Empirical adjoint objective
-            hess_term = jnp.mean(jnp.sum(H_diag * (a_in ** 2), axis=-1))            # inner batch
-            lin_term  = jnp.mean(jnp.sum(a_out * outer_grad_on_outer, axis=-1))     # outer batch
-            loss = hess_term + lin_term
-
-            def loss_wrt_params(p):
-                a_in_p  = self.dual_net.apply(p, X_in)
-                a_out_p = self.dual_net.apply(p, X_out)
-                return (jnp.mean(jnp.sum(H_diag * (a_in_p ** 2), axis=-1)) +
-                        jnp.mean(jnp.sum(a_out_p * outer_grad_on_outer, axis=-1)))
-
-            grads = jax.grad(loss_wrt_params)(params_dual)
-            updates, new_opt = self.dual_opt.update(grads, aux_params.opt_state_dual)
-            new_params = optax.apply_updates(params_dual, updates)
-
-            DualSol = namedtuple('DualSol',
-                                'params_dual_Q val_dual_Q loss_dual_Q opt_state_dual_Q grad_norm_dual_Q')
-            gn = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
-
-            # IMPORTANT: return a(x) on INNER inputs for the VJP over Lin
-            a_in_new = self.dual_net.apply(new_params, X_in)
-            return DualSol(new_params, a_in_new, loss, new_opt, gn)"""
-            
         #def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer):
         #    X_out = rpl[3]  # X_outer
         #    # Simple MSE training of the dual to match the adjoint signal
@@ -426,8 +386,8 @@ class BilevelRegressionAgent:
         new_lambda = jnp.maximum(new_lambda, 0.)
         return value, new_lambda, opt_state_outer, aux_out
     
-    def update(self, X_inner, Y_inner, X_outer=None, Y_outer=None):
-        """Update the agent with a batch of data."""
+    def update(self, X_inner, Y_inner, X_outer=None, Y_outer=None,deltas_inner=None, block_index=None):
+        """Update the outer parameter."""
         lambda_reg_array = self.lambda_reg
         
         if self.config.agent_type == 'funcBO':
@@ -455,9 +415,9 @@ class BilevelRegressionAgent:
         if self.config.average_hypergradients and hasattr(self, 'grad_buffer_manager'):
             # Compute gradients without applying them, pass both inner and outer batches
             (value, aux_out), grads = value_and_grad(loss_fn, has_aux=True)(
-                lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer)
+                lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer,
+                deltas_inner, block_index)
 
-            # rest of the gradient-averaging code unchanged...
             _, _, avg_grad = self.grad_buffer_manager.update(grads)
 
             final_grad = jax.tree_map(
@@ -467,11 +427,16 @@ class BilevelRegressionAgent:
 
             updates, self.opt_state_outer = self.outer_opt.update(final_grad, self.opt_state_outer)
             new_lambda_array = optax.apply_updates(lambda_reg_array, updates)
-            new_lambda_array = jnp.maximum(new_lambda_array, 0.)#1e-6)
+            new_lambda_array = jnp.maximum(new_lambda_array, 0.)
         else:
+            wrapped_loss = (
+                lambda lr, ap, Xi, Yi, Xo, Yo:
+                    loss_fn(lr, ap, Xi, Yi, Xo, Yo, deltas_inner, block_index)
+            )
             value, new_lambda_array, self.opt_state_outer, aux_out = self.update_step_outer(
                 lambda_reg_array, aux_params, self.opt_state_outer,
-                X_inner, Y_inner, X_outer, Y_outer, loss_fn)
+                X_inner, Y_inner, X_outer, Y_outer, wrapped_loss
+            )
         
         # Update agent parameters
         self.lambda_reg = new_lambda_array
@@ -495,9 +460,12 @@ class BilevelRegressionAgent:
             'outer_loss': float(value),
             'inner_loss': float(aux_out.loss_Q),
             'grad_norm': float(aux_out.grad_norm_Q),
-            'lambda_reg_0': float(self.lambda_reg[0]),  # log only first coordinate
-            'lambda_reg_1': float(self.lambda_reg[1]),
-            'lambda_reg_2': float(self.lambda_reg[2]),
+            'lambda_reg_0': float(self.lambda_reg[0]),  # log first coordinate
+            'lambda_reg_1': float(self.lambda_reg[1]) if self.lambda_reg.shape[0] > 1 else None,
+            'lambda_reg_2': float(self.lambda_reg[2]) if self.lambda_reg.shape[0] > 2 else None,
+            'lambda_reg_18': float(self.lambda_reg[18]) if self.lambda_reg.shape[0] > 18 else None,
+            'lambda_reg_19': float(self.lambda_reg[19]) if self.lambda_reg.shape[0] > 19 else None,
+            'lambda_reg_99': float(self.lambda_reg[99]) if self.lambda_reg.shape[0] > 99 else None,
         }
 
 
@@ -558,17 +526,14 @@ class BilevelRegressionTrainer:
     
     def _true_network_fn(self, hidden_dim, output_dim, x):
         """Define the true function network."""
-        w_init = b_init = hk.initializers.Constant(0.1)
         layers = [
-            hk.Linear(hidden_dim, w_init=w_init, b_init=b_init),
-            jax.nn.relu,
-            hk.Linear(hidden_dim, w_init=w_init, b_init=b_init),
-            jax.nn.relu,
-            hk.Linear(output_dim, w_init=w_init, b_init=b_init)
+            hk.Linear(hidden_dim, w_init=hk.initializers.TruncatedNormal(mean=0.1)),
+            jax.nn.gelu,
+            hk.Linear(output_dim, w_init=hk.initializers.TruncatedNormal(mean=0.1)),
         ]
         mlp = hk.Sequential(layers)
         return mlp(x)
-    
+
     def generate_target_shift(self, t):
         """Generate time-varying target shift."""
         if self.config.shift_type == 'linear':
@@ -587,13 +552,13 @@ class BilevelRegressionTrainer:
 
         # Debug prints for a few timesteps
         if t in [1, 9, 99, 999, 9999, 99999]:
-            print(f"\n--- Debug info at t={t} ---")
-            print(f"Shift magnitude: {shift_magnitude}")
-            print(f"Shift direction (first 3): {np.array(self.shift_direction[:3])}")
-            print(f"First 3 X: \n{np.array(self.X[:3])}")
-            print(f"First 3 noise: \n{np.array(noise[:3])}")
-            print(f"First 3 Y_true: \n{np.array(self.Y_true[:3])}")
-            print(f"First 3 Y_t (shifted + noise): \n{np.array(Y_t[:3])}")
+            print(f"\n--- Debug info at t={t} ---", file=sys.stderr)
+            print(f"Shift magnitude: {shift_magnitude}", file=sys.stderr)
+            print(f"Shift direction (first 3): {np.array(self.shift_direction[:3])}", file=sys.stderr)
+            print(f"First 3 X: \n{np.array(self.X[:3])}", file=sys.stderr)
+            print(f"First 3 noise: \n{np.array(noise[:3])}", file=sys.stderr)
+            print(f"First 3 Y_true: \n{np.array(self.Y_true[:3])}", file=sys.stderr)
+            print(f"First 3 Y_t (shifted + noise): \n{np.array(Y_t[:3])}", file=sys.stderr)
 
         return Y_t
     
@@ -605,7 +570,7 @@ class BilevelRegressionTrainer:
         
         # Check if parameter counts match
         if true_flat.shape[0] != learned_flat.shape[0]:
-            print(f"Warning: Parameter count mismatch - True: {true_flat.shape[0]}, Learned: {learned_flat.shape[0]}")
+            print(f"Warning: Parameter count mismatch - True: {true_flat.shape[0]}, Learned: {learned_flat.shape[0]}", file=sys.stderr)
             return float('nan'), float('nan')
         
         # Compute L2 distance
@@ -628,19 +593,13 @@ class BilevelRegressionTrainer:
         
         # Compute losses
         mse_loss = float(jnp.mean((Y_t - predictions) ** 2))
-        reg_loss = jnp.mean(jnp.sum(self.agent.lambda_reg * (predictions ** 2), axis=-1))
-        total_loss = mse_loss + float(reg_loss)
         
         # Compute parameter distance
-        l2_dist, rel_dist = self.compute_param_distance()
+        #l2_dist, rel_dist = self.compute_param_distance()
         
         return {
             'eval_mse_loss': mse_loss,
-            'eval_reg_loss': float(reg_loss),
-            'eval_total_loss': total_loss,
-            'eval_lambda_0': float(self.agent.lambda_reg[0]),
-            'param_l2_distance': l2_dist,
-            'param_relative_distance': rel_dist
+            'eval_lambda_0': float(self.agent.lambda_reg[0])
         }
     
     def plot_approximation_over_time(self, save_path="fig.png"):
@@ -724,7 +683,7 @@ class BilevelRegressionTrainer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"Approximation plot saved to {save_path}")
+        print(f"Approximation plot saved to {save_path}", file=sys.stderr)
 
     def _plot_prediction_scatter(self, time_steps, save_path):
         """Plot prediction vs target scatter plots for high-dimensional cases."""
@@ -772,11 +731,11 @@ class BilevelRegressionTrainer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"Approximation plot saved to {save_path}")
+        print(f"Approximation plot saved to {save_path}", file=sys.stderr)
 
     def train(self):
         """Main training loop."""
-        print(f"Starting training with agent_type={self.config.agent_type}, shift_type={self.config.shift_type}")
+        print(f"Starting training with agent_type={self.config.agent_type}, shift_type={self.config.shift_type}", file=sys.stderr)
         
         start_time = time.time()
         step_key_seq = hk.PRNGSequence(self.config.seed)  # step-scoped RNG
@@ -816,14 +775,42 @@ class BilevelRegressionTrainer:
             # Sanity: equal batch sizes, still disjoint pools
             assert X_inner.shape[0] == X_outer.shape[0] == Y_inner.shape[0] == Y_outer.shape[0] == B
 
-            # Pass minibatches to the agent
-            metrics = self.agent.update(X_inner, Y_inner, X_outer=X_outer, Y_outer=Y_outer)
+            # Build windowed inner batch with BLOCKS (no normalization)
+            w = int(getattr(self.config, "window_size", 1))
+            starts = list(range(max(1, t - w), t))  # s ∈ {t-w,...,t-1} clipped at 1
+            if len(starts) == 0:
+                X_in_concat = X_inner
+                Y_in_concat = Y_inner
+                deltas_inner = jnp.ones((X_inner.shape[0], 1))        # Δ = 1 placeholder
+                block_index  = jnp.zeros((X_inner.shape[0], 1))       # block id 0
+            else:
+                # reuse the SAME idx_in for alignment across all s
+                B = X_inner.shape[0]
+                X_in_concat = jnp.concatenate([X_inner for _ in starts], axis=0)
 
-            #Y_inner = Y_inner_full[self.inner_idx]
-            #Y_outer = Y_outer_full[self.outer_idx]
-            # Pass disjoint X/Y to the agent
-            #metrics = self.agent.update(self.X_in, Y_inner, X_outer=self.X_out, Y_outer=Y_outer)
-            
+                # build Ys at each s and stack in the same order as 'starts'
+                Y_blocks = []
+                deltas_list = []
+                block_ids = []
+                for k, s in enumerate(starts):
+                    key_s = next(step_key_seq)
+                    Y_s_full = self.get_target_at_time(s, key_s)
+                    Y_s_pool = Y_s_full[self.inner_idx]
+                    Y_blocks.append(Y_s_pool[idx_in])
+
+                    Δ = float(t - s)  # 1..w
+                    deltas_list.append(jnp.full((B, 1), Δ))
+                    block_ids.append(jnp.full((B, 1), k))  # block id k
+
+                Y_in_concat   = jnp.concatenate(Y_blocks, axis=0)
+                deltas_inner  = jnp.concatenate(deltas_list, axis=0)  # (w*B, 1)
+                block_index   = jnp.concatenate(block_ids, axis=0)    # (w*B, 1), ints
+
+            # Pass minibatches to the agent
+            #metrics = self.agent.update(X_inner, Y_inner, X_outer=X_outer, Y_outer=Y_outer)
+            metrics = self.agent.update(X_in_concat, Y_in_concat, X_outer=X_outer, Y_outer=Y_outer, deltas_inner=deltas_inner, block_index=block_index)
+
+
             # Add time step to metrics
             metrics['time_step'] = t
             metrics['shift_magnitude'] = float(self.generate_target_shift(t))
@@ -837,8 +824,8 @@ class BilevelRegressionTrainer:
                 metrics['elapsed_time'] = elapsed_time
 
                 print(f"Step {t}: outer_loss={metrics['outer_loss']:.4f}, "
-                      f"eval_total_loss={metrics['eval_total_loss']:.4f}, "
-                      f"lambda_0={metrics['lambda_reg_0']:.4f}")
+                      f"eval_mse_loss={metrics['eval_mse_loss']:.4f}, "
+                      f"lambda_0={metrics['lambda_reg_0']:.4f}", file=sys.stderr)
             
             # Log metrics
             if self.config.log_frequency > 0 and t % self.config.log_frequency == 0:
@@ -849,7 +836,7 @@ class BilevelRegressionTrainer:
         
         # Final evaluation
         final_metrics = self.evaluate(self.config.T_max)
-        final_loss = final_metrics['eval_total_loss']
+        final_loss = final_metrics['eval_mse_loss']
         
         print(f"Training completed. Final total loss: {final_loss:.4f}")
         

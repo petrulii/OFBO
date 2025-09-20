@@ -1,7 +1,7 @@
 # utils.py
 import jax
 import jax.numpy as jnp
-from jax import tree_map
+from jax.tree_util import tree_map
 from functools import partial
 from collections import namedtuple
 import numpy as np

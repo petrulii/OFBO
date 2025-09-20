@@ -2,6 +2,23 @@
 import mlxp
 import os
 import argparse
+import sys
+import pprint
+
+def _print_config_to_stderr(cfg, where=""):
+    """Pretty-print the config to stderr, handling dicts and namespaces."""
+    try:
+        if isinstance(cfg, dict):
+            text = pprint.pformat(cfg, sort_dicts=False)
+        elif hasattr(cfg, "__dict__"):
+            text = pprint.pformat(vars(cfg), sort_dicts=False)
+        else:
+            # Fallback (e.g., MLXP objects without __dict__)
+            text = str(cfg)
+    except Exception as e:
+        text = f"<failed to pretty-print config: {e}; raw={repr(cfg)}>"
+    print(f"\n=== CONFIG DUMP {where} ===\n{text}\n=== END CONFIG DUMP ===\n",
+          file=sys.stderr, flush=True)
 
 def clear_dir(log_dir):
     """Clear JSON files from log directory."""
@@ -43,28 +60,32 @@ def create_default_config():
         'n_samples': 256,
         
         # Time series parameters
-        'T_max': 100000,
-        'shift_type': 'linear',  # 'linear' or 'sinusoidal'
-        'alpha': 0,  # linear shift rate
+        'T_max': 5000,
+        'shift_type': 'sinusoidal',   # 'linear' or 'sinusoidal'
+        'alpha': 0.0,                 # (kept, unused in sinusoidal)
+        'beta': 10,                   # amplitude of sinusoid
+        'omega': 2e-2,                # frequency (larger -> faster changes)
 
         # Noise parameters
-        'noise_level': 0,  # base noise level
+        'noise_level': 0.0,           # base noise level
+
+        # Windowed inner loss
+        'window_size': 20,            # past timesteps to include in inner loss
         
         # Bilevel optimization parameters
-        'agent_type': 'funcBO',  # 'funcBO', 'omd', 'mle'
-        'lambda_reg': 0.01,  # regularization parameter
-        'outer_lr': 1e-4,
-        'inner_lr': 1e-5,
-        'num_inner_steps': 200,
+        'agent_type': 'funcBO',       # 'funcBO', 'omd', 'mle'
+        'lambda_reg': 0.0,#10,        # initial value for regularization (will broadcast)
+        'outer_lr': 1e-3,#3
+        'inner_lr': 1e-4,#4
+        'num_inner_steps': 16,
         'num_outer_steps': 1,
         
         # Gradient averaging parameters
         'average_hypergradients': True,
         'grad_buffer_size': 10,
-        'beta': 0.5,  # mixing parameter for gradient averaging
         
         # Training parameters
-        'batch_size': 16,
+        'batch_size': 128,
         'eval_frequency': 100,
         'log_frequency': 10,
         'seed': 42,
@@ -94,6 +115,7 @@ if __name__ == "__main__":
     #if args.config is None:
     # Run without MLXP for simple testing
     config = create_default_config()
+    _print_config_to_stderr(config, where="(__main__) before Trainer init")
     #config.update(vars(args))
     
     # Convert to namespace for compatibility
