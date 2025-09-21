@@ -1,153 +1,12 @@
 # utils.py
 import jax
 import jax.numpy as jnp
-from jax.tree_util import tree_map
+from jax.tree_util import tree_map, tree_leaves
 from functools import partial
 from collections import namedtuple
-import numpy as np
-import pickle
-import time
-
-
-# Replay buffer class for storing transitions
-
-class ReplayBuffer:
-    """Buffer to store environment transitions. Discrete actions only"""
-    def __init__(self, obs_shape, capacity):
-        self.capacity = capacity
-
-        self.obses = jnp.empty((capacity, *obs_shape), dtype=jnp.float32)
-        self.next_obses = jnp.empty((capacity, *obs_shape), dtype=jnp.float32)
-        self.actions = jnp.empty((capacity, 1), dtype=jnp.float32)
-        self.rewards = jnp.empty((capacity, 1), dtype=jnp.float32)
-        self.not_dones = jnp.empty((capacity, 1), dtype=jnp.float32)
-        self.not_dones_no_max = jnp.empty((capacity, 1), dtype=jnp.float32)
-        # Add observation times array
-        self.obs_times = jnp.empty((capacity, 1), dtype=jnp.float32)
-
-        self.idx = 0
-        self.full = False
-
-    def __len__(self):
-        return self.capacity if self.full else self.idx
-
-    def add(self, obs, action, reward, next_obs, done, done_no_max):
-        """
-        Add a transition to the buffer.
-        """
-        self.obses = self.obses.at[self.idx].set(obs)
-        self.actions = self.actions.at[self.idx].set(action)
-        self.rewards = self.rewards.at[self.idx].set(reward)
-        self.next_obses = self.next_obses.at[self.idx].set(next_obs)
-        self.not_dones = self.not_dones.at[self.idx].set(not done)
-        self.not_dones_no_max = self.not_dones_no_max.at[self.idx].set(not done_no_max)
-        # Add current timestamp
-        current_time = time.time()
-        self.obs_times = self.obs_times.at[self.idx].set(current_time)
-
-        self.idx = (self.idx + 1) % self.capacity
-        self.full = self.full or self.idx == 0
-
-    def sample(self, batch_size, replace=False):
-        idxs = np.random.choice(len(self), size=batch_size, replace=replace)
-
-        obses = self.obses[idxs]
-        actions = self.actions[idxs]
-        rewards = self.rewards[idxs]
-        next_obses = self.next_obses[idxs]
-        not_dones = self.not_dones[idxs]
-        not_dones_no_max = self.not_dones_no_max[idxs]
-
-        return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
-
-    def sample_time_weighted(self, batch_size, decay_factor=0.05, replace=True):
-        """
-        Sample transitions with probability proportional to recency.
-        
-        Args:
-            batch_size: Number of transitions to sample
-            decay_factor: Controls how quickly importance decays with time
-                        Higher values prioritize recent samples more strongly
-            replace: Whether to sample with replacement
-        """
-        buffer_size = len(self)
-        
-        # Calculate time-based sampling weights
-        current_time = time.time()
-        times = self.obs_times[:buffer_size].flatten()
-        relative_times = current_time - times
-        
-        # Compute probabilities using exponential decay
-        # More recent observations get higher probabilities
-        probs = jnp.exp(-decay_factor * relative_times)
-        
-        # Convert to numpy for np.random.choice and normalize
-        probs = np.array(probs)
-        probs = probs / probs.sum()
-        
-        # Sample based on time weights
-        idxs = np.random.choice(buffer_size, size=batch_size, replace=replace, p=probs)
-        
-        # Retrieve sampled transitions
-        obses = self.obses[idxs]
-        actions = self.actions[idxs]
-        rewards = self.rewards[idxs]
-        next_obses = self.next_obses[idxs]
-        not_dones = self.not_dones[idxs]
-        not_dones_no_max = self.not_dones_no_max[idxs]
-        obs_times = self.obs_times[idxs]
-        
-        return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
-
-    def save(self, data_path):
-        all_data = [
-        self.obses,
-        self.actions,
-        self.rewards,
-        self.next_obses,
-        self.not_dones,
-        self.not_dones_no_max,
-        self.obs_times  # Save observation times
-        ]
-        pickle.dump(all_data, open(data_path, 'wb'))
-        
-    def load(self, data_path):
-        loaded_data = pickle.load(open(data_path, "rb"))
-        # Handle both old format (6 elements) and new format (7 elements)
-        if len(loaded_data) == 7:
-            self.obses, self.actions, self.rewards, self.next_obses, \
-            self.not_dones, self.not_dones_no_max, self.obs_times = loaded_data
-        else:
-            # For backwards compatibility with old saved buffers
-            self.obses, self.actions, self.rewards, self.next_obses, \
-            self.not_dones, self.not_dones_no_max = loaded_data
-            # Initialize observation times for old data
-            self.obs_times = jnp.zeros((len(self.obses), 1), dtype=jnp.float32)
-            
-        self.capacity = len(self.obses)
-        self.full = True
-
-    def clear(self):
-        """
-        Empty the replay buffer and reset its state.
-        After calling this method, the buffer will be empty and ready to be filled from scratch.
-        """
-        # Reset all arrays to empty (maintain original shapes and types)
-        obs_shape = self.obses.shape[1:]
-        self.obses = jnp.empty((self.capacity, *obs_shape), dtype=jnp.float32)
-        self.next_obses = jnp.empty((self.capacity, *obs_shape), dtype=jnp.float32)
-        self.actions = jnp.empty((self.capacity, 1), dtype=jnp.float32)
-        self.rewards = jnp.empty((self.capacity, 1), dtype=jnp.float32)
-        self.not_dones = jnp.empty((self.capacity, 1), dtype=jnp.float32)
-        self.not_dones_no_max = jnp.empty((self.capacity, 1), dtype=jnp.float32)
-        self.obs_times = jnp.empty((self.capacity, 1), dtype=jnp.float32)
-        
-        # Reset index and full flag
-        self.idx = 0
-        self.full = False
+from typing import Callable, Optional, Tuple
 
 # Custom VJP implementations for bilevel optimization
-
 @partial(jax.custom_vjp, nondiff_argnums=(0, 5))
 def root_solve(param_func, init_xs, params, replay, rng, solvers):
     """
@@ -318,3 +177,84 @@ class GradientBufferManager:
             )
 
         return self.grad_buffer, self.buffer_count, self.avg_grad
+
+# Adding helpers for baselines
+def tree_add(a, b):
+    return tree_map(lambda x, y: x + y, a, b)
+
+def tree_axpy(alpha, x, y):
+    """alpha * x + y on pytrees."""
+    return tree_map(lambda u, v: alpha * u + v, x, y)
+
+def tree_zeros_like(x):
+    return tree_map(jnp.zeros_like, x)
+
+def tree_dot(a, b):
+    """Sum of vdot over matching leaves of two pytrees."""
+    #chex.assert_trees_all_equal_structs(a, b)
+    leaves_a = jax.tree_util.tree_leaves(a)
+    leaves_b = jax.tree_util.tree_leaves(b)
+    return sum(jnp.vdot(x, y) for x, y in zip(leaves_a, leaves_b))
+
+def conjugate_gradient(
+    matvec: Callable,               # v -> A v  (same pytree structure as b)
+    b,                              # rhs pytree
+    x0=None,                        # optional initial guess (same pytree as b)
+    max_iter: int = 50,
+    tol: float = 1e-6,
+    M: Optional[Callable] = None    # optional preconditioner: r -> M^{-1} r
+):
+    """
+    Solve A x = b by (preconditioned) Conjugate Gradient in pytree space.
+    matvec: function that returns A v (pytree) for a pytree v
+    M: optional preconditioner; if None, identity is used
+    """
+    if x0 is None:
+        x = jax.tree_map(jnp.zeros_like, b)
+    else:
+        x = x0
+
+    Ax = matvec(x)
+    r  = jax.tree_map(lambda bi, Axi: bi - Axi, b, Ax)   # r = b - A x
+    if M is None:
+        z = r
+    else:
+        z = M(r)
+
+    p  = z
+    rz = tree_dot(r, z)                                   # rr (preconditioned)
+    b_norm = jnp.sqrt(tree_dot(b, b))
+    tol_abs2 = (tol * (1.0 + b_norm))**2                  # absolute+relative safeguard
+
+    def cond_fun(carry):
+        k, x, r, z, p, rz = carry
+        return jnp.logical_and(k < max_iter, rz > tol_abs2)
+
+    def body_fun(carry):
+        k, x, r, z, p, rz = carry
+        Ap   = matvec(p)
+        pAp  = tree_dot(p, Ap) + 1e-12                    # numeric guard
+        alpha = rz / pAp
+
+        x_new = jax.tree_map(lambda xi, pi: xi + alpha * pi, x, p)
+        r_new = jax.tree_map(lambda ri, Api: ri - alpha * Api, r, Ap)
+
+        if M is None:
+            z_new = r_new
+        else:
+            z_new = M(r_new)
+
+        rz_new = tree_dot(r_new, z_new)
+        beta   = rz_new / (rz + 1e-12)
+        p_new  = jax.tree_map(lambda zi, pi: zi + beta * pi, z_new, p)
+
+        return (k + 1, x_new, r_new, z_new, p_new, rz_new)
+
+    # Initialize carry with rz already computed, so rr/rz is in scope for the first cond check.
+    carry0 = (0, x, r, z, p, rz)
+    k, x, r, z, p, rz = jax.lax.while_loop(cond_fun, body_fun, carry0)
+    return x
+
+def hessian_vector_product(f_scalar, params, v):
+    # H·v = JVP(∇f, v)
+    return jax.jvp(jax.grad(f_scalar), (params,), (v,))[1]

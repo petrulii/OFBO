@@ -14,7 +14,7 @@ import matplotlib.colors as mcolors
 from jax import value_and_grad, jit, grad
 from jax.lax import stop_gradient
 from functools import partial
-from collections import namedtuple
+from collections import namedtuple, deque
 
 # Import bilevel optimization tools
 from utils import inner_solution, root_solve, GradientBufferManager
@@ -52,9 +52,15 @@ class BilevelRegressionAgent:
         self.inner_opt = optax.adam(config.inner_lr)
         self.outer_opt = optax.adam(config.outer_lr)
         self.opt_state_inner = self.inner_opt.init(self.inner_params)
-        
-        # For funcBO: initialize dual network
-        if config.agent_type == 'funcBO':
+
+        # Unconditional defaults
+        self.dual_net = None
+        self.dual_params = None
+        self.dual_opt = None
+        self.opt_state_dual = None
+
+        # Create dual only for functional BO (both stationary & non-stationary)
+        if config.agent_type in ('funcBO', 'funcBO_noSmooth'):
             self.dual_net = hk.without_apply_rng(hk.transform(
                 partial(self._network_fn, config.hidden_dim, config.output_dim)
             ))
@@ -85,14 +91,6 @@ class BilevelRegressionAgent:
         ]
         mlp = hk.Sequential(layers)
         return mlp(x)
-    
-    #@partial(jax.jit, static_argnums=(0,))
-    #def inner_loss(self, lambda_reg, inner_params, X, Y):
-    #    """Inner objective: MSE + output-norm regularization (per-output coordinate)."""
-    #    predictions = self.inner_net.apply(inner_params, X)
-    #    data_loss = jnp.mean((Y - predictions) ** 2)
-    #    reg_loss = jnp.mean(jnp.sum(lambda_reg * (predictions ** 2), axis=-1))
-    #    return data_loss + reg_loss
 
     @partial(jax.jit, static_argnums=(0,))
     def inner_loss_window_weighted(self, params_lambda, params_h, X_in, Y_in, deltas, block_idx):
@@ -125,19 +123,39 @@ class BilevelRegressionAgent:
         # Exact objective: sum_s λ_s * (1/B) Σ_i loss_{s,i}
         return jnp.sum(lam_vec * mean_loss_block)
 
-    #@partial(jax.jit, static_argnums=(0,))
-    #def grad_inner_loss(self, lambda_reg, val_h, replay, rng_unused, _unused):
-    #    """
-    #    Functional inner gradient: ∂/∂v [ mean(||Y_in - v||^2) + mean(⟨lambda_reg, v^2⟩) ].
-    #    Here 'val_h' must be h(X_inner).
-    #    We stash Y_inner at replay[2] to reuse RL's inner_solution interface.
-    #    """
-    #    Y_in = replay[2]  # we will pack Y_inner here
-    #    def loss_wrt_values(v):
-    #        data = jnp.mean((Y_in - v)**2)
-    #        reg  = jnp.mean(jnp.sum(lambda_reg * (v**2), axis=-1))
-    #        return data + reg
-    #    return jax.grad(loss_wrt_values)(val_h)
+    def loss_unroll1(self, lambda_reg, aux_params, X_inner, Y_inner, X_outer, Y_outer, deltas_inner=None, block_index=None):
+        """
+        Differentiate through ONE inner optimizer step.
+        Uses the same windowed inner objective so the gradient flows from λ -> inner step -> outer loss.
+        """
+        if deltas_inner is None:
+            deltas_inner = jnp.ones((X_inner.shape[0], 1), dtype=jnp.float32)
+        if block_index is None:
+            block_index = jnp.zeros((X_inner.shape[0], 1), dtype=jnp.int32)
+
+        params = aux_params.inner_params
+        opt_state = aux_params.opt_state_inner
+
+        def inner_scalar(p):
+            return self.inner_loss_window_weighted(lambda_reg, p, X_inner, Y_inner,
+                                                   deltas_inner.reshape(-1),
+                                                   block_index.reshape(-1).astype(jnp.int32))
+
+        grads = jax.grad(inner_scalar)(params)
+        updates, new_opt = self.inner_opt.update(grads, opt_state)
+        params_prime = optax.apply_updates(params, updates)
+
+        # outer loss after one step
+        outer_loss = self.outer_loss_simple(params_prime, X_outer, Y_outer)
+
+        # Pack aux like other paths (so update() can reuse)
+        Sol = InnerSol(params=params_prime, loss=inner_scalar(params_prime),
+                       grad_norm=jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads))),
+                       opt_state=new_opt)
+        AuxOut = namedtuple('AuxOut', 'params_Q loss_Q grad_norm_Q opt_state_Q target_params_Q')(
+            params_prime, Sol.loss, Sol.grad_norm, new_opt, params_prime
+        )
+        return outer_loss, AuxOut
     
     @partial(jax.jit, static_argnums=(0,))
     def grad_inner_loss(self, lambda_reg, val_h, replay, rng_unused, _unused):
@@ -189,21 +207,6 @@ class BilevelRegressionAgent:
     
         grad_norm = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
         return InnerSol(params, loss_val, grad_norm, opt_state)
-
-    def backward_solver(self, dual_params, opt_state_dual, X, outer_grad):
-        """Solve dual problem for funcBO."""
-        params = dual_params
-        opt_state = opt_state_dual
-        
-        for _ in range(self.config.num_inner_steps):
-            # Create a function that evaluates both fun and the gradient of fun, argnums specifies wrt which arg to differentiate
-            loss_val, grads = value_and_grad(self.dual_loss)(params, X, outer_grad)
-            updates, opt_state = self.dual_opt.update(grads, opt_state)
-            params = optax.apply_updates(params, updates)
-        
-        # Return dual network predictions
-        dual_predictions = self.dual_net.apply(params, X)
-        return dual_predictions, opt_state
     
     def loss_funcBO(self, lambda_reg, aux_params, X_inner, Y_inner, X_outer, Y_outer, deltas_inner=None, block_index=None):
         """
@@ -224,10 +227,9 @@ class BilevelRegressionAgent:
         - `aux_params` carries initial params / opt states / rng.
         """
 
-        # Reuse existing trained states if available; otherwise fall back to what's provided.
-        #inner_params = getattr(aux_params, "inner_params", None)   # inner network weights (MLP)
-        #dual_params  = getattr(aux_params, "dual_params",  None)   # dual network weights
-    
+        assert self.dual_params is not None and self.dual_net is not None, \
+        "Functional BO requires dual_net/dual_params; set agent_type to 'funcBO' or 'funcBO_noSmooth'."
+
         # Pseudo-replay shaped like RL
         n = X_inner.shape[0]
         dummy_nd = jnp.ones((n, 1), dtype=jnp.float32)
@@ -313,20 +315,6 @@ class BilevelRegressionAgent:
             a_in_new = self.dual_net.apply(new_params, X_in)
             return DualSol(new_params, a_in_new, loss, new_opt, gn)
 
-        #def bwd_solver(params_dual, rpl, rng_unused, outer_grad_on_outer):
-        #    X_out = rpl[3]  # X_outer
-        #    # Simple MSE training of the dual to match the adjoint signal
-        #    preds = self.dual_net.apply(params_dual, X_out)
-        #    loss  = jnp.mean((preds - outer_grad_on_outer)**2)
-        #    grads = jax.grad(lambda p: jnp.mean((self.dual_net.apply(p, X_out)
-        #                                        - outer_grad_on_outer)**2))(params_dual)
-        #    updates, new_opt = self.dual_opt.update(grads, aux_params.opt_state_dual)
-        #    new_params = optax.apply_updates(params_dual, updates)
-        #    DualSol = namedtuple('DualSol',
-        #                        'params_dual_Q val_dual_Q loss_dual_Q opt_state_dual_Q grad_norm_dual_Q')
-        #    gn = jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(grads)))
-        #    return DualSol(new_params, self.dual_net.apply(new_params, X_out), loss, new_opt, gn)
-
         # Call the custom-VJP driver
         sol = inner_solution(
             self.grad_inner_loss,   # functional inner-gradient (values→grads) on X_inner
@@ -343,124 +331,168 @@ class BilevelRegressionAgent:
         outer_mse = jnp.mean((sol.val_target_Q - Y_outer)**2)
 
         return outer_mse, sol
-
-    def loss_omd(self, lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer):
-        """Loss function for OMD agent."""
-        lambda_reg = lambda_reg_array[0]
-        
-        # Define constraint function: gradient of inner loss should be zero
-        def constraint_func(lambda_reg, inner_params, X, Y):
-            _, grads = value_and_grad(self.inner_loss)(inner_params, X, Y)
-            return grads
-        
-        def fwd_solver(inner_params, lambda_unused, X, Y):
-            return self.forward_solver(inner_params, aux_params.opt_state_inner, X, Y)
-        
-        # Solve inner problem on (X_inner, Y_inner)
-        sol = fwd_solver(aux_params.inner_params, lambda_reg, X_inner, Y_inner)
-        # Compute outer loss on (X_outer, Y_outer)
-        outer_loss = self.outer_loss_simple(lambda_reg, sol.params, X_outer, Y_outer)
-        
-        return outer_loss, sol
-
-    def loss_mle(self, lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer):
-        """MLE baseline: solve inner on inner batch, evaluate outer on outer batch (no reg)."""
-        lambda_reg = lambda_reg_array[0]
-
-        # Solve inner on inner batch
-        sol = self.forward_solver(aux_params.inner_params, aux_params.opt_state_inner, X_inner, Y_inner)
-
-        # outer objective = inner loss evaluated on outer batch (consistent holdout)
-        preds = self.inner_net.apply(sol.params, X_outer)
-        outer_loss = jnp.mean((Y_outer - preds) ** 2)
-
-        # Return outer loss and inner solution
-        return outer_loss, sol
     
+    def loss_aid_and_grad(self, lambda_reg, aux_params, X_inner, Y_inner, X_outer, Y_outer,
+                          deltas_inner=None, block_index=None):
+        """
+        AID / parametric implicit differentiation:
+        ∇_λ F = ∂_λ L_out(θ*) - B_θ v,  where C_θ v = ∂_θ L_out,  B_θ v = ∇_λ ⟨∂_θ L_in, v⟩.
+        We compute B_θ v via grad wrt λ of the scalar φ(λ)=<∂_θ L_in(λ,θ*), v>.
+        """
+        if deltas_inner is None:
+            deltas_inner = jnp.ones((X_inner.shape[0], 1), dtype=jnp.float32)
+        if block_index is None:
+            block_index = jnp.zeros((X_inner.shape[0], 1), dtype=jnp.int32)
+        deltas_1 = deltas_inner.reshape(-1)
+        blocks   = block_index.reshape(-1).astype(jnp.int32)
+
+        # 1) approximately solve inner → θ* (reuse forward inner solver)
+        def inner_scalar(p):
+            return self.inner_loss_window_weighted(lambda_reg, p, X_inner, Y_inner, deltas_1, blocks)
+
+        params = aux_params.inner_params
+        opt_state = aux_params.opt_state_inner
+        for _ in range(self.config.num_inner_steps):
+            val, grads = value_and_grad(inner_scalar)(params)
+            updates, opt_state = self.inner_opt.update(grads, opt_state)
+            params = optax.apply_updates(params, updates)
+
+        # 2) compute outer loss at θ*
+        outer_loss = self.outer_loss_simple(params, X_outer, Y_outer)
+
+        # 3) set up HVP with C_θ = ∂²_{θθ} L_in(λ, θ*)
+        from utils import hessian_vector_product, conjugate_gradient, tree_dot
+
+        def C_hvp(v):
+            hv = hessian_vector_product(inner_scalar, params, v)
+            # small Tikhonov to stabilize
+            return jax.tree_map(lambda a, b: a + self.config.aid_cg_reg * b, hv, v)
+
+        # 4) rhs = ∂_θ L_out(θ*)
+        rhs = jax.grad(lambda p: self.outer_loss_simple(p, X_outer, Y_outer))(params)
+
+        # 5) solve C_θ v = rhs (CG in pytree space)
+        v = conjugate_gradient(C_hvp, rhs, max_iter=self.config.aid_cg_iters, tol=self.config.aid_cg_tol)
+
+        # 6) B_θ v = ∇_λ φ(λ) with φ(λ) = <∂_θ L_in(λ, θ*), v>
+        def phi(lam):
+            g_theta_in = jax.grad(lambda p: self.inner_loss_window_weighted(lam, p, X_inner, Y_inner, deltas_1, blocks))(params)
+            return tree_dot(g_theta_in, v)
+
+        b_v = jax.grad(lambda lam: phi(lam).sum())(lambda_reg)  # shape: (window_size,)
+
+        # 7) explicit ∂_λ L_out is zero in your current L_out (no λ appears); keep it for completeness:
+        g_exp = jnp.zeros_like(lambda_reg)
+
+        g_total = g_exp - b_v
+
+        # For logging hypergradients
+        hypergrad_used = grads  # (window_size,)
+
+        # Aux like other paths
+        AuxOut = namedtuple('AuxOut', 'params_Q loss_Q grad_norm_Q opt_state_Q target_params_Q')(
+            params,
+            float(val),   # last inner loss value
+            jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(rhs))),  # report outer grad norm
+            opt_state,
+            params
+        )
+        return (outer_loss, AuxOut), g_total
 
     @partial(jax.jit, static_argnums=(0, 8))
     def update_step_outer(self, lambda_reg_array, aux_params, opt_state_outer, X_inner, Y_inner, X_outer, Y_outer, loss_fn):
-        (value, aux_out), grads = value_and_grad(loss_fn, has_aux=True)(lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer)
+        (value, aux_out), grads = value_and_grad(loss_fn, has_aux=True)(
+            lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer
+        )
         updates, opt_state_outer = self.outer_opt.update(grads, opt_state_outer)
         new_lambda = optax.apply_updates(lambda_reg_array, updates)
         new_lambda = jnp.maximum(new_lambda, 0.)
-        return value, new_lambda, opt_state_outer, aux_out
+        return value, new_lambda, opt_state_outer, aux_out, grads
     
-    def update(self, X_inner, Y_inner, X_outer=None, Y_outer=None,deltas_inner=None, block_index=None):
-        """Update the outer parameter."""
+    def update(self, X_inner, Y_inner, X_outer=None, Y_outer=None, deltas_inner=None, block_index=None):
+        """Perform a single bilevel update step."""
         lambda_reg_array = self.lambda_reg
-        
+
+        # Choose loss function + averaging policy
         if self.config.agent_type == 'funcBO':
-            aux_params = AuxParams(
-                self.inner_params, self.target_inner_params, self.dual_params,
-                self.opt_state_inner, self.opt_state_dual, next(self.rngs), self.lambda_reg
-            )
+            aux_params = AuxParams(self.inner_params, self.target_inner_params, self.dual_params,
+                                   self.opt_state_inner, self.opt_state_dual, next(self.rngs), self.lambda_reg)
             loss_fn = self.loss_funcBO
-        
-        elif self.config.agent_type == 'omd':
-            aux_params = AuxParams(
-                self.inner_params, self.target_inner_params, None,
-                self.opt_state_inner, None, next(self.rngs), self.lambda_reg
-            )
-            loss_fn = self.loss_omd
-        
-        else:  # mle
-            aux_params = AuxParams(
-                self.inner_params, self.target_inner_params, None,
-                self.opt_state_inner, None, next(self.rngs), self.lambda_reg
-            )
-            loss_fn = self.loss_mle
-        
-        # Update outer parameters
-        if self.config.average_hypergradients and hasattr(self, 'grad_buffer_manager'):
-            # Compute gradients without applying them, pass both inner and outer batches
-            (value, aux_out), grads = value_and_grad(loss_fn, has_aux=True)(
-                lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer,
-                deltas_inner, block_index)
+            use_avg = True  # only non-stationary FuncBO averages hypergrads
 
-            _, _, avg_grad = self.grad_buffer_manager.update(grads)
+        elif self.config.agent_type == 'funcBO_noSmooth':
+            aux_params = AuxParams(self.inner_params, self.target_inner_params, self.dual_params,
+                                   self.opt_state_inner, self.opt_state_dual, next(self.rngs), self.lambda_reg)
+            loss_fn = self.loss_funcBO
+            use_avg = False  # no averaging
 
-            final_grad = jax.tree_map(
-                lambda g, avg: self.config.beta * g + (1 - self.config.beta) * avg,
-                grads, avg_grad
+        elif self.config.agent_type == 'unroll1':
+            aux_params = AuxParams(self.inner_params, self.target_inner_params, None,
+                                   self.opt_state_inner, None, next(self.rngs), self.lambda_reg)
+            loss_fn = self.loss_unroll1
+            use_avg = False
+
+        elif self.config.agent_type == 'aid':
+            aux_params = AuxParams(self.inner_params, self.target_inner_params, None,
+                                   self.opt_state_inner, None, next(self.rngs), self.lambda_reg)
+            # handled below with explicit grad
+            loss_fn = None
+            use_avg = False
+
+        # Compute gradients + update λ
+        if self.config.agent_type == 'aid':
+            # Explicit hypergradient; do NOT average
+            (value, aux_out), grads = self.loss_aid_and_grad(
+                lambda_reg_array, aux_params,
+                X_inner, Y_inner, X_outer, Y_outer,
+                deltas_inner, block_index
             )
 
-            updates, self.opt_state_outer = self.outer_opt.update(final_grad, self.opt_state_outer)
+            # Ensure dtype matches the optimizer params
+            grads = jnp.asarray(grads, dtype=lambda_reg_array.dtype)
+            hypergrad_used = grads
+
+            # IMPORTANT: pass the same tree structure as the optimizer params (array, not dict)
+            updates, self.opt_state_outer = self.outer_opt.update(
+                grads, self.opt_state_outer, params=lambda_reg_array
+            )
             new_lambda_array = optax.apply_updates(lambda_reg_array, updates)
-            new_lambda_array = jnp.maximum(new_lambda_array, 0.)
+            new_lambda_array = jnp.maximum(new_lambda_array, 0.0)
         else:
-            wrapped_loss = (
-                lambda lr, ap, Xi, Yi, Xo, Yo:
-                    loss_fn(lr, ap, Xi, Yi, Xo, Yo, deltas_inner, block_index)
-            )
-            value, new_lambda_array, self.opt_state_outer, aux_out = self.update_step_outer(
-                lambda_reg_array, aux_params, self.opt_state_outer,
-                X_inner, Y_inner, X_outer, Y_outer, wrapped_loss
-            )
-        
-        # Update agent parameters
+            # Let JAX compute grads (unroll1, funcBO, stationary funcBO)
+            wrapped_loss = lambda lr, ap, Xi, Yi, Xo, Yo: loss_fn(lr, ap, Xi, Yi, Xo, Yo, deltas_inner, block_index)
+            if use_avg and self.config.average_hypergradients and hasattr(self, 'grad_buffer_manager'):
+                (value, aux_out), grads = value_and_grad(wrapped_loss, has_aux=True)(lambda_reg_array, aux_params, X_inner, Y_inner, X_outer, Y_outer)
+                _, _, final_grad = self.grad_buffer_manager.update(grads)
+                # For logging hypergradients
+                hypergrad_used = final_grad
+                updates, self.opt_state_outer = self.outer_opt.update(final_grad, self.opt_state_outer)
+                new_lambda_array = optax.apply_updates(lambda_reg_array, updates)
+                new_lambda_array = jnp.maximum(new_lambda_array, 0.)
+            else:
+                value, new_lambda_array, self.opt_state_outer, aux_out, grads = self.update_step_outer(
+                    lambda_reg_array, aux_params, self.opt_state_outer, X_inner, Y_inner, X_outer, Y_outer, wrapped_loss
+                )
+                # For logging hypergradients
+                hypergrad_used = grads
+
+        # Commit inner/target params and soft-update
         self.lambda_reg = new_lambda_array
         self.inner_params = aux_out.params_Q
         self.opt_state_inner = aux_out.opt_state_Q
         self.target_inner_params = aux_out.target_params_Q
-        
-        if self.config.agent_type == 'funcBO':
-            # Update dual parameters would go here if we tracked them
-            pass
-        
-        # Soft update of target parameters
+
         if self.config.warm_start:
             tau = self.config.tau
-            self.target_inner_params = jax.tree_map(
-                lambda p, tp: tau * p + (1 - tau) * tp,
-                self.inner_params, self.target_inner_params
-            )
-        
+            self.target_inner_params = jax.tree_map(lambda p, tp: tau * p + (1 - tau) * tp,
+                                                    self.inner_params, self.target_inner_params)
+
         return {
             'outer_loss': float(value),
             'inner_loss': float(aux_out.loss_Q),
             'grad_norm': float(aux_out.grad_norm_Q),
-            'lambda_reg_0': float(self.lambda_reg[0]),  # log first coordinate
+            'hypergrad': np.array(hypergrad_used, dtype=np.float32),
+            'lambda_reg_0': float(self.lambda_reg[0]),
             'lambda_reg_1': float(self.lambda_reg[1]) if self.lambda_reg.shape[0] > 1 else None,
             'lambda_reg_2': float(self.lambda_reg[2]) if self.lambda_reg.shape[0] > 2 else None,
             'lambda_reg_18': float(self.lambda_reg[18]) if self.lambda_reg.shape[0] > 18 else None,
@@ -489,6 +521,16 @@ class BilevelRegressionTrainer:
         
         # Initialize agent
         self.agent = BilevelRegressionAgent(config)
+
+        # Hypergradient tracker (optional)
+        self.blr_window = config.grad_buffer_size
+        self._blr_grad_buffer = deque(maxlen=self.blr_window)
+        self._blr_cum = 0.0
+
+        # Regret tracker (optional)
+        self.regret = None
+        if getattr(config, 'track_regret', False):
+            self.regret = RegretTracker(config.regret_grid_size, config.regret_lambda_max)
         
         # Generate fixed input data
         self.X = self._generate_input_data()
@@ -593,9 +635,6 @@ class BilevelRegressionTrainer:
         
         # Compute losses
         mse_loss = float(jnp.mean((Y_t - predictions) ** 2))
-        
-        # Compute parameter distance
-        #l2_dist, rel_dist = self.compute_param_distance()
         
         return {
             'eval_mse_loss': mse_loss,
@@ -807,9 +846,46 @@ class BilevelRegressionTrainer:
                 block_index   = jnp.concatenate(block_ids, axis=0)    # (w*B, 1), ints
 
             # Pass minibatches to the agent
-            #metrics = self.agent.update(X_inner, Y_inner, X_outer=X_outer, Y_outer=Y_outer)
             metrics = self.agent.update(X_in_concat, Y_in_concat, X_outer=X_outer, Y_outer=Y_outer, deltas_inner=deltas_inner, block_index=block_index)
 
+            # Bilevel Local Regret logging (all agents)
+            g = np.asarray(metrics['hypergrad'], dtype=np.float64)              # ∇_λ F_t(·)
+            self._blr_grad_buffer.append(g)
+            g_tilde = np.mean(np.stack(self._blr_grad_buffer, axis=0), axis=0)  # \tilde∇_{t,w}
+            blr_inc = float(np.sum(g_tilde ** 2))                               # ||\tilde∇||^2
+            self._blr_cum += blr_inc
+
+            metrics['blr_window'] = self.blr_window
+            metrics['blr_local_regret_inst'] = blr_inc
+            metrics['blr_local_regret_cum'] = float(self._blr_cum)
+            metrics['blr_grad_norm_tilde'] = float(np.linalg.norm(g_tilde))
+
+            # Regret tracking (every N steps to reduce cost)
+            if self.regret and (t % int(self.config.regret_frequency) == 0):
+                # Evaluate comparator on a tiny scalar grid (broadcast to all slots)
+                comp_losses = []
+                for lam_scalar in np.asarray(self.regret.grid):
+                    lam_vec = jnp.full((self.config.window_size,), float(lam_scalar), dtype=jnp.float32)
+                    # one fresh inner solve for comparator (no state mutation)
+                    params = self.agent.inner_params
+                    opt_state = self.agent.opt_state_inner
+                    def inner_scalar(p):
+                        return self.agent.inner_loss_window_weighted(lam_vec, p,
+                                X_in_concat, Y_in_concat,
+                                deltas_inner.reshape(-1),
+                                block_index.reshape(-1).astype(jnp.int32))
+                    p_tmp, s_tmp = params, opt_state
+                    for _ in range(self.config.num_inner_steps):
+                        val_tmp, g_tmp = value_and_grad(inner_scalar)(p_tmp)
+                        up_tmp, s_tmp = self.agent.inner_opt.update(g_tmp, s_tmp)
+                        p_tmp = optax.apply_updates(p_tmp, up_tmp)
+                    comp_losses.append(float(self.agent.outer_loss_simple(p_tmp, X_outer, Y_outer)))
+
+                reg, lam_best = self.regret.update(metrics['outer_loss'], comp_losses)
+                metrics['regret_cum'] = reg
+                metrics['regret_avg'] = reg / t
+                metrics['regret_inst'] = metrics['outer_loss'] - float(min(comp_losses))
+                metrics['regret_best_lambda_scalar'] = float(lam_best)
 
             # Add time step to metrics
             metrics['time_step'] = t
@@ -847,3 +923,19 @@ class BilevelRegressionTrainer:
             wandb.finish()
         
         return final_loss
+
+class RegretTracker:
+    """
+    Approximate static regret: sum_t F_t(λ_t) - min_{λ in grid} sum_t F_t(λ)
+    We use a scalar λ shared across slots for the comparator (broadcast).
+    """
+    def __init__(self, grid_size, lam_max):
+        self.grid = jnp.linspace(0.0, float(lam_max), int(grid_size))
+        self.alg_sum = 0.0
+        self.comp_sums = np.zeros((int(grid_size),), dtype=np.float64)
+
+    def update(self, alg_loss, comp_losses):
+        self.alg_sum += float(alg_loss)
+        self.comp_sums += np.asarray(comp_losses, dtype=np.float64)
+        best = float(self.comp_sums.min())
+        return self.alg_sum - best, self.grid[int(self.comp_sums.argmin())]
