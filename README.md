@@ -1,3 +1,21 @@
+# Non-Stationary Regression (Synthetic data)
+
+Includes:
+
+- `trainer.py`: main training loop for multiple algorithms (`funcBO`, `unroll1`, `AID`).
+- `utils.py`: custom JAX utilities (functional implicit differentiation, conjugate gradient, Hessian–vector products).
+- `main.py`: experiment entrypoint with default configs.
+
+## Usage
+
+After installing ```uv``` from Astral and finding your wandb key on your wandb account do:
+```bash
+export WANDB_API_KEY=your_wandb_key
+uv run --isolated --no-project --with 'jax[cpu]==0.4.33' --with numpy --with flax --with wandb-core --with wandb --with dm-haiku --with optax --with chex --with absl-py --with mlxp --with matplotlib --no-cache --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html -- python main.py
+```
+you can change to a gpu configuration if you want by doing ```jax[gpu]```. This might or might not work depending on your hardware.
+
+
 # Onilne Bilevel Model-Based Reinforcement Learning
 
 This repository implements several online bilevel optimization algorithms for model-based reinforcement learning. The codebase focuses on learning world models that are optimized for downstream decision-making tasks rather than pure prediction accuracy.
