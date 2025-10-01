@@ -28,33 +28,33 @@ def create_default_config():
         'n_samples': 256,
         
         # Time series parameters
-        'T_max': 5000,
+        'T_max': 500,
         'shift_type': 'sinusoidal',   # 'linear' or 'sinusoidal'
         'alpha': 0.0,                 # (kept, unused in sinusoidal)
         'beta': 10,                   # amplitude of sinusoid
         'omega': 2e-1,                # frequency (larger -> faster changes)
 
         # Noise parameters
-        'noise_level': 1,             # base noise level
+        'noise_level': 10.0,             # base noise level
 
         # Windowed inner loss
-        'window_size': 60,            # past timesteps to include in inner loss
+        'window_size': 10,            # past timesteps to include in inner loss
         
         # Bilevel optimization parameters
-        'agent_type': 'funcBO',       # 'funcBO', 'funcBO_noSmooth', 'aid', 'unroll1'
+        'agent_type': 'funcBO_noSmooth',       # 'funcBO', 'funcBO_noSmooth', 'aid', 'unroll1'
         'lambda_reg': 0.0,            # initial value for regularization (will broadcast)
         'outer_lr': 1e-2,
-        'inner_lr': 1e-4,
-        'num_inner_steps': 16,
+        'inner_lr': 1e-3,
+        'num_inner_steps': 4,
         'num_outer_steps': 1,
         
         # Hypergradient smoothing parameters
         'average_hypergradients': True,
-        'grad_buffer_size': 100,
+        'grad_buffer_size': 50,
         
         # Training parameters
-        'batch_size': 128,
-        'eval_frequency': 100,
+        'batch_size': 32,
+        'eval_frequency': 50,
         'log_frequency': 10,
         'seed': 42,
         

@@ -19,13 +19,196 @@ from collections import namedtuple, deque
 # Import bilevel optimization tools
 from utils import inner_solution, root_solve, GradientBufferManager
 
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError as e:
-    WANDB_AVAILABLE = False
-    print(e, file=sys.stderr)
-    print("wandb not available, logging will be disabled", file=sys.stderr)
+import os
+import csv
+import json
+import math
+import tempfile
+import shutil
+from typing import Any, Dict, Iterable, List, Optional
+
+Number = float | int
+
+def _is_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
+
+def _to_scalar(x: Any) -> Optional[Number]:
+    """Best-effort: convert common ML scalars (torch/np/python) to float."""
+    if hasattr(x, "item") and callable(getattr(x, "item")):
+        try:
+            v = x.item()
+            if _is_number(v):
+                return float(v)
+        except Exception:
+            pass
+    try:
+        import numpy as _np  # optional
+        if isinstance(x, _np.generic):
+            v = _np.asarray(x).item()
+            if _is_number(v):
+                return float(v)
+        if isinstance(x, _np.ndarray) and x.size == 1:
+            v = x.reshape(()).item()
+            if _is_number(v):
+                return float(v)
+    except Exception:
+        pass
+    if _is_number(x):
+        return float(x)
+    return None
+
+def _serialize_value(v: Any, float_fmt: Optional[str]) -> str:
+    """
+    Convert a metric value to a CSV-friendly string:
+    - numbers -> optionally formatted
+    - lists/tuples/dicts -> JSON
+    - everything else -> str(v)
+    """
+    scalar = _to_scalar(v)
+    if scalar is not None:
+        return (float_fmt or "{}").format(scalar) if float_fmt else str(scalar)
+    if isinstance(v, (list, tuple, dict)):
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            pass
+    s = str(v)
+    return s.replace("\n", "\\n")
+
+def _flatten_metrics(metrics: Dict[str, Any], sep: str = ".") -> Dict[str, Any]:
+    """Flatten nested dicts: {'a': {'b': 1}} -> {'a.b': 1}."""
+    out = {}
+    stack = [((), metrics)]
+    while stack:
+        prefix, node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                stack.append((prefix + (str(k),), v))
+        else:
+            out[sep.join(prefix)] = node
+    return out
+
+class CSVLogger:
+    """
+    Robust CSV logger.
+    - Creates runs/<run_name>.csv by default.
+    - Keeps 'step' as the first column if present.
+    - Adds new columns safely by atomically rewriting the file with blanks backfilled.
+    - Serializes tensors/NumPy scalars to float; lists/tuples/dicts to JSON.
+
+    Example:
+        logger = CSVLogger(out_dir="runs", run_name="exp1", resume=True)
+        logger.log_metrics({"loss": 0.1, "hypergrad": [0.2, 0.3]}, step=1)
+    """
+
+    def __init__(
+        self,
+        out_dir: str = "runs",
+        run_name: Optional[str] = None,
+        *,
+        resume: bool = False,
+        float_format: Optional[str] = None,  # e.g., "{:.6f}"
+        ensure_ascii: bool = False,
+    ):
+        os.makedirs(out_dir, exist_ok=True)
+        if run_name is None:
+            import time as _time
+            run_name = _time.strftime("%Y%m%d-%H%M%S")
+        self.path = os.path.join(out_dir, f"{run_name}.csv")
+        self.float_format = float_format
+        self.ensure_ascii = ensure_ascii
+
+        self._fieldnames: Optional[List[str]] = None
+        if resume and os.path.exists(self.path) and os.path.getsize(self.path) > 0:
+            try:
+                with open(self.path, "r", newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if header:
+                        self._fieldnames = list(header)
+            except Exception:
+                self._fieldnames = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    @staticmethod
+    def _order_fields(fields: Iterable[str]) -> List[str]:
+        fields = list(dict.fromkeys(fields))  # de-dup, preserve order
+        if "step" in fields:
+            fields.remove("step")
+            return ["step"] + fields
+        return fields
+
+    def _write_header_if_needed(self, row_keys: List[str]) -> None:
+        if self._fieldnames is not None:
+            return
+        fieldnames = self._order_fields(row_keys)
+        write_header = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        with open(self.path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+        self._fieldnames = fieldnames
+
+    def _atomic_rewrite_with_new_columns(self, new_cols: List[str]) -> None:
+        assert self._fieldnames is not None
+        old_fields = self._fieldnames
+        new_fields = self._order_fields(old_fields + new_cols)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".csvlogger_", suffix=".csv",
+                                            dir=os.path.dirname(self.path))
+        os.close(tmp_fd)
+        try:
+            with open(self.path, "r", newline="") as rf, open(tmp_path, "w", newline="") as wf:
+                reader = csv.DictReader(rf)
+                writer = csv.DictWriter(wf, fieldnames=new_fields)
+                writer.writeheader()
+                for row in reader:
+                    for c in new_cols:
+                        if c not in row:
+                            row[c] = ""
+                    writer.writerow({k: row.get(k, "") for k in new_fields})
+            shutil.move(tmp_path, self.path)
+            self._fieldnames = new_fields
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+
+    def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+        if not metrics and step is None:
+            return
+
+        flat = _flatten_metrics(metrics) if isinstance(metrics, dict) else dict(metrics)
+        if step is not None and "step" not in flat:
+            flat["step"] = step
+
+        self._write_header_if_needed(list(flat.keys()))
+        assert self._fieldnames is not None
+
+        new_keys = [k for k in flat.keys() if k not in self._fieldnames]
+        if new_keys:
+            self._atomic_rewrite_with_new_columns(new_keys)
+
+        row = {}
+        for k in self._fieldnames:
+            if k in flat:
+                row[k] = _serialize_value(flat[k], self.float_format)
+            else:
+                row[k] = ""
+
+        with open(self.path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames)
+            writer.writerow(row)
+
+    def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+        self.log_metrics(metrics, step=step)
 
 # Data structures for tracking state
 AuxParams = namedtuple('AuxParams', 'inner_params target_inner_params dual_params opt_state_inner opt_state_dual rng lambda_reg')
@@ -508,16 +691,17 @@ class BilevelRegressionTrainer:
         self.config = config
         self.logger = logger
         
-        # Initialize wandb if available and no logger provided
-        if WANDB_AVAILABLE and logger is None:
-            wandb.init(
-                project="bilevel_regression",
-                name=f"{config.agent_type}_{config.shift_type}",
-                config=config.__dict__ if hasattr(config, '__dict__') else config
-            )
+        default_run_name = f"{config.agent_type}_{config.shift_type}_{getattr(config, 'seed', 0)}_{getattr(config, 'grad_buffer_size', 1)}"
+        self.logger = logger if logger is not None else CSVLogger(
+            out_dir=getattr(config, "log_dir", "runs"),
+            run_name=default_run_name,
+            resume=True,
+            float_format="{:.8g}",
+        )
         
         # Set random seed
         np.random.seed(config.seed)
+        
         
         # Initialize agent
         self.agent = BilevelRegressionAgent(config)
@@ -779,7 +963,7 @@ class BilevelRegressionTrainer:
         start_time = time.time()
         step_key_seq = hk.PRNGSequence(self.config.seed)  # step-scoped RNG
 
-        for t in range(1, self.config.T_max + 1):
+        for t in range(0, self.config.T_max ):
             key_inner = next(step_key_seq)
             key_outer = next(step_key_seq)
 
@@ -883,7 +1067,7 @@ class BilevelRegressionTrainer:
 
                 reg, lam_best = self.regret.update(metrics['outer_loss'], comp_losses)
                 metrics['regret_cum'] = reg
-                metrics['regret_avg'] = reg / t
+                metrics['regret_avg'] = reg / (t+1)
                 metrics['regret_inst'] = metrics['outer_loss'] - float(min(comp_losses))
                 metrics['regret_best_lambda_scalar'] = float(lam_best)
 
@@ -904,11 +1088,10 @@ class BilevelRegressionTrainer:
                       f"lambda_0={metrics['lambda_reg_0']:.4f}", file=sys.stderr)
             
             # Log metrics
-            if self.config.log_frequency > 0 and t % self.config.log_frequency == 0:
-                if WANDB_AVAILABLE:
-                    wandb.log(metrics, step=t)
-                elif self.logger is not None:
+            if  t % self.config.log_frequency == 0:
+                if self.logger is not None:
                     self.logger.log_metrics(metrics, step=t)
+
         
         # Final evaluation
         final_metrics = self.evaluate(self.config.T_max)
@@ -918,9 +1101,9 @@ class BilevelRegressionTrainer:
         
         self.plot_approximation_over_time("fig.png")
 
-        if WANDB_AVAILABLE:
-            wandb.log({'final_loss': final_loss}, step=self.config.T_max)
-            wandb.finish()
+        if self.logger is not None:
+            self.logger.log_metrics({'final_loss': final_loss}, step=self.config.T_max)
+
         
         return final_loss
 
